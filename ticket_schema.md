@@ -1,5 +1,7 @@
 # HYBRIS Ticket Schema
 
+> See also: [docs/domain-model.md](docs/domain-model.md) · [docs/ticket-lifecycle.md](docs/ticket-lifecycle.md) · [docs/roles-and-authority.md](docs/roles-and-authority.md)
+
 ## Ticket Format
 
 Each ticket is a single Markdown file placed in a ticket state directory.
