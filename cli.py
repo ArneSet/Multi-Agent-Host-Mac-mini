@@ -14,6 +14,7 @@ Usage:
     python3 cli.py reject TICKET_ID [--reason REASON]
     python3 cli.py reticket TICKET_ID [--reason REASON]
     python3 cli.py promote TICKET_ID [--dry-run]
+    python3 cli.py promotion-check TICKET_ID
 """
 
 import argparse
@@ -31,10 +32,12 @@ from orchestrator import (
     write_log,
     resolve_agent_repo,
     resolve_prod_repo,
+    validate_repo_separation,
     create_review_package,
     load_review_package,
     create_approval_decision,
     load_approval_decision,
+    check_promotion_readiness,
     create_promotion_request,
 )
 
@@ -140,6 +143,13 @@ def cmd_validate(cfg, args):
     elif not Path(prod_repo).is_dir():
         errors.append(f"prod_repo not found: {prod_repo}")
 
+    # Check repo separation (Sprint 4: must be distinct physical paths)
+    if test_repo and prod_repo and Path(test_repo).is_dir() and Path(prod_repo).is_dir():
+        try:
+            validate_repo_separation(cfg)
+        except ValueError as e:
+            errors.append(str(e))
+
     # Check repo root (legacy compat)
     repo = Path(cfg.get("game_repo_root", ""))
     if repo and repo.is_dir() and not (repo / "Assets").is_dir():
@@ -165,18 +175,31 @@ def cmd_validate(cfg, args):
         print(f"  ✓ Artifacts and sessions directories exist")
         print(f"  ✓ Repo targets: test_repo={test_repo}")
         print(f"  ✓ Repo targets: prod_repo={prod_repo}")
+        print(f"  ✓ Repo separation: physically distinct paths")
         print(f"  ✓ All {len(cfg['allowed_workers'])} worker modules present")
         return 0
 
 
 def cmd_repo_targets(cfg, args):
-    """Show configured repo targets."""
+    """Show configured repo targets with separation status."""
     repo_targets = cfg.get("repo_targets", {})
     test_repo = repo_targets.get("test_repo", "(not set)")
     prod_repo = repo_targets.get("prod_repo", "(not set)")
     print("Repo Targets:")
     print(f"  test_repo: {test_repo}")
+    if test_repo != "(not set)":
+        print(f"    resolved: {Path(test_repo).resolve()}")
     print(f"  prod_repo: {prod_repo}")
+    if prod_repo != "(not set)":
+        print(f"    resolved: {Path(prod_repo).resolve()}")
+    print()
+
+    # Separation check
+    try:
+        validate_repo_separation(cfg)
+        print("Separation: ✓ physically distinct paths")
+    except ValueError:
+        print("Separation: ✗ SAME PHYSICAL PATH — not safe for operation")
     print()
     print("Rules:")
     print("  • Agents work exclusively in test_repo")
@@ -285,6 +308,22 @@ def cmd_promote(cfg, args):
         return 1
 
 
+def cmd_promotion_check(cfg, args):
+    """Check promotion readiness for a ticket."""
+    try:
+        result = check_promotion_readiness(cfg, args.ticket_id)
+        print(f"Promotion Readiness: {args.ticket_id}")
+        print(f"  Ready: {'✓ YES' if result['ready'] else '✗ NO'}")
+        print()
+        for check in result["checks"]:
+            mark = "✓" if check["passed"] else "✗"
+            print(f"  {mark} {check['name']}: {check['detail']}")
+        return 0 if result["ready"] else 1
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="HYBRIS Host Orchestrator CLI",
@@ -342,6 +381,10 @@ def main():
     p_promote.add_argument("ticket_id", help="Ticket ID")
     p_promote.add_argument("--dry-run", action="store_true", help="Simulate without writing files")
 
+    # promotion-check
+    p_promcheck = sub.add_parser("promotion-check", help="Check promotion readiness for a ticket")
+    p_promcheck.add_argument("ticket_id", help="Ticket ID")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -357,6 +400,7 @@ def main():
         "reject": cmd_reject,
         "reticket": cmd_reticket,
         "promote": cmd_promote,
+        "promotion-check": cmd_promotion_check,
     }
 
     return commands[args.command](cfg, args)

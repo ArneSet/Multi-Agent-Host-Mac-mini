@@ -90,6 +90,28 @@ def validate_repo_target(cfg: dict, target: str, allow_prod: bool = False):
         )
 
 
+def validate_repo_separation(cfg: dict) -> bool:
+    """Validate that test_repo and prod_repo resolve to different physical paths.
+    Raises ValueError if they are the same or missing.
+    Returns True if separation is valid.
+    """
+    test_path = resolve_agent_repo(cfg)
+    prod_path = resolve_prod_repo(cfg)
+
+    test_real = Path(test_path).resolve()
+    prod_real = Path(prod_path).resolve()
+
+    if test_real == prod_real:
+        raise ValueError(
+            f"REPO SEPARATION VIOLATION: test_repo and prod_repo resolve to the "
+            f"same physical path: {test_real}\n"
+            f"  test_repo config: {test_path}\n"
+            f"  prod_repo config: {prod_path}\n"
+            f"Physical separation is required for safe operation."
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Sanitization
 # ---------------------------------------------------------------------------
@@ -622,10 +644,84 @@ def load_approval_decision(cfg: dict, ticket_id: str) -> dict:
         return json.load(f)
 
 
+def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
+    """Check all preconditions for promotion. Returns structured result.
+
+    Result: {
+        "ready": bool,
+        "ticket_id": str,
+        "checks": [{"name": str, "passed": bool, "detail": str}, ...]
+    }
+    """
+    ticket_id = sanitize_ticket_id(ticket_id)
+    checks = []
+
+    # 1. ReviewPackage exists
+    try:
+        review = load_review_package(cfg, ticket_id)
+        checks.append({"name": "review_package", "passed": True,
+                        "detail": f"ReviewPackage exists (created {review.get('created_at', '?')})"})
+    except FileNotFoundError:
+        checks.append({"name": "review_package", "passed": False,
+                        "detail": "No ReviewPackage found"})
+
+    # 2. ApprovalDecision exists and is 'approved'
+    try:
+        approval = load_approval_decision(cfg, ticket_id)
+        decision = approval.get("decision", "?")
+        if decision == "approved":
+            checks.append({"name": "approval_decision", "passed": True,
+                            "detail": f"Decision: approved by {approval.get('reviewer', '?')}"})
+        else:
+            checks.append({"name": "approval_decision", "passed": False,
+                            "detail": f"Decision is '{decision}', not 'approved'"})
+    except FileNotFoundError:
+        checks.append({"name": "approval_decision", "passed": False,
+                        "detail": "No ApprovalDecision found"})
+
+    # 3. Repo separation is enforced
+    try:
+        validate_repo_separation(cfg)
+        checks.append({"name": "repo_separation", "passed": True,
+                        "detail": "test_repo and prod_repo are physically distinct"})
+    except ValueError as e:
+        checks.append({"name": "repo_separation", "passed": False,
+                        "detail": str(e)})
+
+    # 4. Both repo paths exist as directories
+    try:
+        test_path = resolve_agent_repo(cfg)
+        if Path(test_path).is_dir():
+            checks.append({"name": "test_repo_exists", "passed": True,
+                            "detail": f"test_repo exists: {test_path}"})
+        else:
+            checks.append({"name": "test_repo_exists", "passed": False,
+                            "detail": f"test_repo not found: {test_path}"})
+    except ValueError as e:
+        checks.append({"name": "test_repo_exists", "passed": False, "detail": str(e)})
+
+    try:
+        prod_path = resolve_prod_repo(cfg)
+        if Path(prod_path).is_dir():
+            checks.append({"name": "prod_repo_exists", "passed": True,
+                            "detail": f"prod_repo exists: {prod_path}"})
+        else:
+            checks.append({"name": "prod_repo_exists", "passed": False,
+                            "detail": f"prod_repo not found: {prod_path}"})
+    except ValueError as e:
+        checks.append({"name": "prod_repo_exists", "passed": False, "detail": str(e)})
+
+    ready = all(c["passed"] for c in checks)
+    return {"ready": ready, "ticket_id": ticket_id, "checks": checks}
+
+
 def create_promotion_request(cfg: dict, ticket_id: str,
                              dry_run: bool = False) -> dict:
-    """Create a PromotionRequest. Requires approved ApprovalDecision."""
+    """Create a PromotionRequest. Requires approved ApprovalDecision and repo separation."""
     ticket_id = sanitize_ticket_id(ticket_id)
+
+    # Enforce physical repo separation
+    validate_repo_separation(cfg)
 
     # Load and verify approval
     approval = load_approval_decision(cfg, ticket_id)

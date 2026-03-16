@@ -565,6 +565,121 @@ class TestReviewApprovalPromotion(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Physical repo separation (Sprint 4)
+# ---------------------------------------------------------------------------
+
+class TestRepoSeparation(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        # Ensure prod_repo dir exists
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_separation_valid_different_paths(self):
+        """test_repo and prod_repo are different paths → passes."""
+        self.assertTrue(orc.validate_repo_separation(self.cfg))
+
+    def test_separation_fails_same_path(self):
+        """If both point to same path, validation must fail."""
+        self.cfg["repo_targets"]["prod_repo"] = self.tmp
+        with self.assertRaises(ValueError) as ctx:
+            orc.validate_repo_separation(self.cfg)
+        self.assertIn("REPO SEPARATION VIOLATION", str(ctx.exception))
+
+    def test_separation_fails_same_via_symlink(self):
+        """Symlink to same path must be detected as same physical path."""
+        link_path = os.path.join(self.tmp, "symlink_to_tmp")
+        os.symlink(self.tmp, link_path)
+        self.cfg["repo_targets"]["test_repo"] = self.tmp
+        self.cfg["repo_targets"]["prod_repo"] = link_path
+        with self.assertRaises(ValueError):
+            orc.validate_repo_separation(self.cfg)
+
+    def test_separation_detects_relative_same(self):
+        """Relative paths that resolve to same real path must fail."""
+        self.cfg["repo_targets"]["prod_repo"] = os.path.join(self.tmp, "sub", "..")
+        with self.assertRaises(ValueError):
+            orc.validate_repo_separation(self.cfg)
+
+
+# ---------------------------------------------------------------------------
+# Promotion readiness (Sprint 4)
+# ---------------------------------------------------------------------------
+
+class TestPromotionReadiness(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put_ticket_in_review(self, ticket_id="t-ready1"):
+        _create_ticket(self.cfg, "review", ticket_id, branch="feature/test")
+        return ticket_id
+
+    def test_readiness_all_pass(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertTrue(result["ready"])
+        self.assertTrue(all(c["passed"] for c in result["checks"]))
+
+    def test_readiness_no_review(self):
+        _create_ticket(self.cfg, "review", "t-norev")
+        result = orc.check_promotion_readiness(self.cfg, "t-norev")
+        self.assertFalse(result["ready"])
+        names = {c["name"] for c in result["checks"] if not c["passed"]}
+        self.assertIn("review_package", names)
+
+    def test_readiness_no_approval(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertFalse(result["ready"])
+        names = {c["name"] for c in result["checks"] if not c["passed"]}
+        self.assertIn("approval_decision", names)
+
+    def test_readiness_rejected_not_ready(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "rejected")
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertFalse(result["ready"])
+
+    def test_readiness_fails_same_repo_path(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        # Force same path
+        self.cfg["repo_targets"]["prod_repo"] = self.tmp
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertFalse(result["ready"])
+        names = {c["name"] for c in result["checks"] if not c["passed"]}
+        self.assertIn("repo_separation", names)
+
+    def test_promotion_blocked_same_path(self):
+        """create_promotion_request must fail if repos are not separated."""
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        self.cfg["repo_targets"]["prod_repo"] = self.tmp
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, tid)
+        self.assertIn("REPO SEPARATION VIOLATION", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main()

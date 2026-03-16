@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `main` (Sprint 3)  
+> **Branch:** `main` (Sprint 4)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 3 — Dual Repo Promotion Architecture  
+> **Status:** Sprint 4 — Physical Repo Separation & Promotion Safety  
 
 ---
 
@@ -261,20 +261,35 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
 
 ---
 
-## 9. Dual Repo Architecture
+## 9. Dual Repo Architecture — Physical Separation
 
-> Vollständige Definition: [docs/dual-repo-architecture.md](docs/dual-repo-architecture.md)
+> Vollständige Definition: [docs/dual-repo-architecture.md](docs/dual-repo-architecture.md)  
+> Physische Trennung: [docs/physical-repo-separation.md](docs/physical-repo-separation.md)  
+> Betriebsregeln: [docs/test-vs-prod-operating-rules.md](docs/test-vs-prod-operating-rules.md)
 
 ### Prinzip
 
 Agenten arbeiten **ausschließlich** im **Test Repo**. Das **Prod Repo** ist nur über eine genehmigte Promotion erreichbar. Kein Agent hat jemals direkten Schreibzugriff auf Prod.
 
+**Ab Sprint 4** sind test_repo und prod_repo **physisch getrennte Git-Clones** mit eigenen `.git`-Verzeichnissen. `validate_repo_separation()` erzwingt, dass beide via `Path.resolve()` auf unterschiedliche Pfade zeigen. Symlinks, relative Pfade und Duplikate werden erkannt und blockiert.
+
+### Physisches Layout
+
+```
+~/Workspace/HYBRIS/repos/
+├── hybris-host/    ← Host-Repo (Orchestrator, CLI, Config)
+├── hybris-test/    ← Agent-Arbeitsrepo (frischer Clone)
+└── hybris-prod/    ← Produktionsrepo (nur Promotion)
+```
+
+Beide Game-Repos sind Clones von `agentavis-ai/HYBRIS---Mortal-Realm.git`.
+
 ### Repo Targets in Config
 
 ```json
 "repo_targets": {
-  "test_repo": "/path/to/test/game-repo",
-  "prod_repo": "/path/to/prod/game-repo"
+  "test_repo": "~/Workspace/HYBRIS/repos/hybris-test",
+  "prod_repo": "~/Workspace/HYBRIS/repos/hybris-prod"
 }
 ```
 
@@ -285,6 +300,8 @@ Agenten arbeiten **ausschließlich** im **Test Repo**. Das **Prod Repo** ist nur
 | `resolve_agent_repo(cfg)` | Gibt immer `test_repo` zurück — einziger Repo-Pfad für Worker |
 | `resolve_prod_repo(cfg)` | Gibt `prod_repo` zurück — nur für Promotion |
 | `validate_repo_target(cfg, target, allow_prod)` | Blockiert `prod_repo` als Agent-Ziel |
+| `validate_repo_separation(cfg)` | Prüft physische Trennung via `Path.resolve()` — **Sprint 4** |
+| `check_promotion_readiness(cfg, ticket_id)` | 5-Punkt-Readiness-Check vor Promotion — **Sprint 4** |
 | `dispatch_worker()` | Setzt `_agent_repo` im Worker-Config auf `test_repo` |
 
 ### Autoritätsmatrix
@@ -323,6 +340,10 @@ Ticket in review
 3. **PromotionRequest** erfordert `decision == "approved"`
 4. Promotion ist **nie automatisch** — Creative Director muss genehmigen
 5. `--dry-run` bei Promotion schreibt keine Datei
+6. **Repo-Separation** wird vor jeder Promotion geprüft (`validate_repo_separation`) — **Sprint 4**
+7. **Readiness-Check** prüft 5 Bedingungen vor Promotion-Erstellung — **Sprint 4**
+
+> Promotion Safety: [docs/promotion-safety.md](docs/promotion-safety.md)
 
 ### CLI-Befehle
 
@@ -333,7 +354,8 @@ Ticket in review
 | `reject TICKET_ID` | Ticket ablehnen |
 | `reticket TICKET_ID` | Ticket zurückgeben (neuer Scope) |
 | `promote TICKET_ID` | Promotion-Request erstellen |
-| `repo-targets` | Konfigurierte Repo-Targets anzeigen |
+| `promotion-check TICKET_ID` | Readiness-Check vor Promotion — **Sprint 4** |
+| `repo-targets` | Konfigurierte Repo-Targets anzeigen (mit Separation-Status) |
 
 ---
 
@@ -349,7 +371,7 @@ hybris-host/
 ├── cli.py                             ← CLI-Entrypoint
 ├── config.json                        ← Lokale Config (gitignored)
 ├── config.example.json                ← Config-Template
-├── test_orchestrator.py               ← Unit Tests (34 Tests)
+├── test_orchestrator.py               ← Unit Tests (66 Tests)
 ├── ticket_schema.md                   ← Ticket-Format-Referenz
 ├── docs/
 │   ├── domain-model.md                ← Domain Model
@@ -357,7 +379,10 @@ hybris-host/
 │   ├── roles-and-authority.md         ← Rollen & Autoritätsmatrix
 │   ├── dual-repo-architecture.md      ← Dual Repo (Sprint 3)
 │   ├── promotion-flow.md              ← Promotion Flow (Sprint 3)
-│   └── repo-authority-boundaries.md   ← Repo Authority (Sprint 3)
+│   ├── repo-authority-boundaries.md   ← Repo Authority (Sprint 3)
+│   ├── physical-repo-separation.md    ← Physische Trennung (Sprint 4)
+│   ├── promotion-safety.md            ← Promotion Safety (Sprint 4)
+│   └── test-vs-prod-operating-rules.md ← Betriebsregeln (Sprint 4)
 └── workers/
     ├── __init__.py
     ├── base_worker.py
@@ -395,8 +420,8 @@ hybris-host/
 | `game_repo_root` | Pfad zum HYBRIS Game Repo (Legacy) | `~/Workspace/HYBRIS/repos/hybris-game` |
 | `host_repo_root` | Pfad zum Host Repo | `~/Workspace/HYBRIS/repos/hybris-host` |
 | `management_root` | Runtime-Daten (nicht versioniert) | `~/Workspace/HYBRIS/management` |
-| `repo_targets.test_repo` | Agent-Arbeitsrepo (nur Lesen+Schreiben) | `~/Desktop/HYBRIS - Mortal Realm` |
-| `repo_targets.prod_repo` | Produktionsrepo (nur Promotion) | `~/Desktop/HYBRIS - Mortal Realm` |
+| `repo_targets.test_repo` | Agent-Arbeitsrepo (physisch getrennt) | `~/Workspace/HYBRIS/repos/hybris-test` |
+| `repo_targets.prod_repo` | Produktionsrepo (nur Promotion) | `~/Workspace/HYBRIS/repos/hybris-prod` |
 
 ---
 
@@ -457,7 +482,9 @@ hybris-host/
 | Log-Pfad Traversal | `write_log()` — Category-Regex + path_within | ✓ |
 | Worker Injection | Doppeltes Gate: hardcoded Map ∩ Config Allowlist | ✓ |
 | Repo Access | `validate_repo_target()` — Agents blocked from prod_repo | ✓ |
+| Repo Separation | `validate_repo_separation()` — test≠prod via Path.resolve() | ✓ |
 | Promotion | Requires approved ApprovalDecision, immutable records | ✓ |
+| Promotion Readiness | `check_promotion_readiness()` — 5-point check before promotion | ✓ |
 
 ### Concurrency
 
@@ -501,10 +528,12 @@ hybris-host/
 | 7 | DirectorRequest nur als manuelles Ticket | Erwartungsgemäß | Sprint 5 |
 | 8 | `fcntl.flock` nur lokal (kein NFS/Multi-Host) | Niedrig (einzelner Host) | — |
 | 9 | Kein Retry-Counter / Max-Retries | Niedrig | Sprint 3 |
-| 10 | Desktop-Pfad im Game Repo noch nicht migriert | Betriebsrisiko | Sprint 4 |
-| 11 | test_repo und prod_repo zeigen aktuell auf gleichen Pfad | Betriebsrisiko | Sprint 4: Repo-Split |
-| 12 | Promotion führt noch keine Git-Operationen aus | Erwartungsgemäß | Sprint 4 |
-| 13 | Kein QA-Gate zwischen active und review | Erwartungsgemäß | Sprint 4 |
+| 10 | ~~Desktop-Pfad im Game Repo noch nicht migriert~~ | ~~Betriebsrisiko~~ | ✅ Sprint 4: Config zeigt auf physische Clones |
+| 11 | ~~test_repo und prod_repo zeigen auf gleichen Pfad~~ | ~~Betriebsrisiko~~ | ✅ Sprint 4: Physisch getrennt + validate_repo_separation() |
+| 12 | Promotion führt noch keine Git-Operationen aus | Erwartungsgemäß | Sprint 5 |
+| 13 | Kein QA-Gate zwischen active und review | Erwartungsgemäß | Sprint 5 |
+| 14 | Promotion Readiness prüft, führt aber nicht aus | Erwartungsgemäß | Sprint 5: Automated promotion |
+| 15 | Legacy hybris-game Symlink noch vorhanden | Niedrig | Manuelles Cleanup |
 
 ---
 
@@ -516,7 +545,9 @@ hybris-host/
 | 2026-03-16 | `v0.1.0` | Tag: Sprint 1 Release |
 | 2026-03-16 | `a3f2f5d` | Sprint 2: Domain Model + System Reference (squash merge) |
 | 2026-03-16 | `v0.2.0` | Tag: Sprint 2 Release |
-| 2026-03-16 | — | Sprint 3: Dual Repo Promotion Architecture (this branch) |
+| 2026-03-16 | `fb8f959` | Sprint 3: Dual Repo Promotion Architecture (squash merge) |
+| 2026-03-16 | `v0.3.0` | Tag: Sprint 3 Release |
+| 2026-03-16 | — | Sprint 4: Physical Repo Separation & Promotion Safety (this branch) |
 
 ---
 
@@ -526,3 +557,4 @@ hybris-host/
 |-------|-------|----------|
 | 2026-03-16 | Sprint 2 Agent | Erstversion: System Reference, Domain Model, Ticket Lifecycle, Roles & Authority |
 | 2026-03-16 | Sprint 3 Agent | Dual Repo Architecture, Promotion Flow, Repo Authority, CLI-Erweiterung, 22 neue Tests |
+| 2026-03-16 | Sprint 4 Agent | Physical Repo Separation, Promotion Safety, Readiness Check, 3 neue Docs, 10 neue Tests (66 total) |
