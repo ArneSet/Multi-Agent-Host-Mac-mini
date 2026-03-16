@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -43,6 +44,9 @@ REPO_TARGETS = frozenset(["test_repo", "prod_repo"])
 
 # Promotion targets
 PROMOTION_TARGETS = frozenset(["test", "prod"])
+
+# Promotion statuses (Sprint 5)
+PROMOTION_STATUSES = frozenset(["pending", "previewed", "executed", "failed", "dry_run"])
 
 # ---------------------------------------------------------------------------
 # Config
@@ -644,6 +648,46 @@ def load_approval_decision(cfg: dict, ticket_id: str) -> dict:
         return json.load(f)
 
 
+def create_qa_result(cfg: dict, ticket_id: str, passed: bool,
+                     notes: str = "") -> dict:
+    """Record a QA validation result for a ticket. Requires existing ReviewPackage.
+    QA results are immutable — once recorded, cannot be changed."""
+    ticket_id = sanitize_ticket_id(ticket_id)
+    load_review_package(cfg, ticket_id)
+
+    qa_path = _reviews_dir(cfg) / f"{ticket_id}.qa.json"
+    if qa_path.exists():
+        raise RuntimeError(
+            f"QA result already exists for '{ticket_id}'. "
+            "Results are immutable."
+        )
+
+    record = {
+        "ticket_id": ticket_id,
+        "passed": bool(passed),
+        "notes": notes,
+        "validated_at": _now(),
+        "validator": "creative-director",
+    }
+
+    with open(qa_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    write_log(cfg, "orchestrator", ticket_id,
+              f"QA result: {'PASSED' if passed else 'FAILED'} — {notes or '(no notes)'}")
+    return record
+
+
+def load_qa_result(cfg: dict, ticket_id: str) -> dict:
+    """Load existing QA result for a ticket."""
+    ticket_id = sanitize_ticket_id(ticket_id)
+    p = _reviews_dir(cfg) / f"{ticket_id}.qa.json"
+    if not p.exists():
+        raise FileNotFoundError(f"No QA result for ticket '{ticket_id}'.")
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
     """Check all preconditions for promotion. Returns structured result.
 
@@ -679,7 +723,20 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
         checks.append({"name": "approval_decision", "passed": False,
                         "detail": "No ApprovalDecision found"})
 
-    # 3. Repo separation is enforced
+    # 3. QA gate passed (Sprint 5)
+    try:
+        qa = load_qa_result(cfg, ticket_id)
+        if qa.get("passed"):
+            checks.append({"name": "qa_gate", "passed": True,
+                            "detail": f"QA passed ({qa.get('validated_at', '?')})"})
+        else:
+            checks.append({"name": "qa_gate", "passed": False,
+                            "detail": f"QA failed: {qa.get('notes', '(no notes)')}"})
+    except FileNotFoundError:
+        checks.append({"name": "qa_gate", "passed": False,
+                        "detail": "No QA result found"})
+
+    # 4. Repo separation is enforced
     try:
         validate_repo_separation(cfg)
         checks.append({"name": "repo_separation", "passed": True,
@@ -688,7 +745,7 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
         checks.append({"name": "repo_separation", "passed": False,
                         "detail": str(e)})
 
-    # 4. Both repo paths exist as directories
+    # 5. Both repo paths exist as directories
     try:
         test_path = resolve_agent_repo(cfg)
         if Path(test_path).is_dir():
@@ -731,6 +788,22 @@ def create_promotion_request(cfg: dict, ticket_id: str,
             f"'{approval['decision']}', not 'approved'."
         )
 
+    # Verify QA gate passed (Sprint 5)
+    qa = load_qa_result(cfg, ticket_id)
+    if not qa.get("passed"):
+        raise ValueError(
+            f"Cannot promote: ticket '{ticket_id}' QA has not passed."
+        )
+
+    # Prevent re-creation of existing request
+    if not dry_run:
+        existing = _promotions_dir(cfg) / f"{ticket_id}.promotion.json"
+        if existing.exists():
+            raise RuntimeError(
+                f"PromotionRequest already exists for '{ticket_id}'. "
+                "Use promote --preview or --execute to proceed."
+            )
+
     # Load review for branch info
     review = load_review_package(cfg, ticket_id)
 
@@ -758,3 +831,200 @@ def create_promotion_request(cfg: dict, ticket_id: str,
               f"PromotionRequest created: {review.get('branch', '?')} "
               f"test_repo → prod_repo (status: pending)")
     return request
+
+
+def load_promotion_request(cfg: dict, ticket_id: str) -> dict:
+    """Load existing PromotionRequest for a ticket."""
+    ticket_id = sanitize_ticket_id(ticket_id)
+    p = _promotions_dir(cfg) / f"{ticket_id}.promotion.json"
+    if not p.exists():
+        raise FileNotFoundError(f"No PromotionRequest for ticket '{ticket_id}'.")
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def update_promotion_status(cfg: dict, ticket_id: str, status: str) -> dict:
+    """Update promotion request status. Appends to status_history."""
+    if status not in PROMOTION_STATUSES:
+        raise ValueError(f"Invalid promotion status: '{status}'. Valid: {sorted(PROMOTION_STATUSES)}")
+
+    ticket_id = sanitize_ticket_id(ticket_id)
+    p = _promotions_dir(cfg) / f"{ticket_id}.promotion.json"
+    if not p.exists():
+        raise FileNotFoundError(f"No PromotionRequest for ticket '{ticket_id}'.")
+
+    with open(p, "r", encoding="utf-8") as f:
+        request = json.load(f)
+
+    request["status"] = status
+    request["updated_at"] = _now()
+    if "status_history" not in request:
+        request["status_history"] = []
+    request["status_history"].append({"status": status, "at": _now()})
+
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(request, f, indent=2, ensure_ascii=False)
+    return request
+
+
+# ---------------------------------------------------------------------------
+# Promotion audit trail (Sprint 5)
+# ---------------------------------------------------------------------------
+
+def _audit_dir(cfg: dict) -> Path:
+    d = Path(cfg["management_root"]) / "promotions" / "audit"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _append_audit_record(cfg: dict, ticket_id: str, record: dict):
+    """Append an audit record to the ticket's audit trail (JSONL)."""
+    ticket_id = sanitize_ticket_id(ticket_id)
+    audit_file = _audit_dir(cfg) / f"{ticket_id}.audit.jsonl"
+    with open(audit_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_audit_trail(cfg: dict, ticket_id: str) -> list:
+    """Load all audit records for a ticket. Returns list of dicts."""
+    ticket_id = sanitize_ticket_id(ticket_id)
+    audit_file = _audit_dir(cfg) / f"{ticket_id}.audit.jsonl"
+    if not audit_file.exists():
+        return []
+    records = []
+    with open(audit_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Promotion execution (Sprint 5)
+# ---------------------------------------------------------------------------
+
+def execute_promotion(cfg: dict, ticket_id: str, dry_run: bool = False) -> dict:
+    """Execute a promotion: fetch branch from test_repo into prod_repo.
+
+    Requires existing PromotionRequest in pending/previewed state and all
+    promotion readiness checks pass (including QA).
+
+    In dry-run mode: verifies branch exists, records preview audit.
+    In execute mode: fetches branch into prod_repo via git fetch.
+
+    Returns audit record dict.
+    """
+    ticket_id = sanitize_ticket_id(ticket_id)
+
+    # 1. Load and verify promotion request
+    request = load_promotion_request(cfg, ticket_id)
+    current_status = request.get("status", "?")
+
+    if current_status == "executed":
+        raise RuntimeError(
+            f"Promotion for '{ticket_id}' was already executed. "
+            "Cannot re-execute an already-promoted ticket."
+        )
+    if current_status not in ("pending", "previewed", "dry_run"):
+        raise RuntimeError(
+            f"Promotion for '{ticket_id}' is in status '{current_status}'. "
+            "Expected 'pending' or 'previewed'."
+        )
+
+    # 2. Re-verify all preconditions
+    readiness = check_promotion_readiness(cfg, ticket_id)
+    if not readiness["ready"]:
+        failed = [c["name"] for c in readiness["checks"] if not c["passed"]]
+        raise ValueError(
+            f"Promotion not ready for '{ticket_id}'. "
+            f"Failed checks: {failed}"
+        )
+
+    # 3. Resolve paths and branch
+    test_path = Path(resolve_agent_repo(cfg)).resolve()
+    prod_path = Path(resolve_prod_repo(cfg)).resolve()
+    branch = request.get("branch", "")
+
+    if not branch or branch == "?":
+        raise ValueError(f"Promotion request for '{ticket_id}' has no valid branch.")
+
+    # 4. Verify branch exists in test_repo
+    verify = subprocess.run(
+        ["git", "-C", str(test_path), "rev-parse", "--verify", branch],
+        capture_output=True, text=True, timeout=30
+    )
+    if verify.returncode != 0:
+        raise ValueError(
+            f"Branch '{branch}' not found in test_repo ({test_path})."
+        )
+    source_commit = verify.stdout.strip()
+
+    # 5. Build audit record
+    audit = {
+        "ticket_id": ticket_id,
+        "promotion_request": f"promotions/{ticket_id}.promotion.json",
+        "source_repo": str(test_path),
+        "target_repo": str(prod_path),
+        "review_package": f"reviews/{ticket_id}.review.json",
+        "approval_decision": f"reviews/{ticket_id}.approval.json",
+        "qa_result": f"reviews/{ticket_id}.qa.json",
+        "branch": branch,
+        "source_commit": source_commit,
+        "action": "preview" if dry_run else "execute",
+        "dry_run": dry_run,
+        "timestamp": _now(),
+        "result": None,
+        "detail": None,
+    }
+
+    if dry_run:
+        audit["result"] = "preview_ok"
+        audit["detail"] = (
+            f"Would fetch branch '{branch}' ({source_commit[:8]}) "
+            f"from {test_path} into {prod_path}"
+        )
+        _append_audit_record(cfg, ticket_id, audit)
+        update_promotion_status(cfg, ticket_id, "previewed")
+        return audit
+
+    # 6. Execute: fetch branch into prod_repo
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(prod_path), "fetch", str(test_path),
+             f"{branch}:{branch}"],
+            capture_output=True, text=True, timeout=120
+        )
+        if fetch.returncode != 0:
+            audit["result"] = "failed"
+            audit["detail"] = fetch.stderr.strip() or "git fetch failed"
+            _append_audit_record(cfg, ticket_id, audit)
+            update_promotion_status(cfg, ticket_id, "failed")
+            raise RuntimeError(
+                f"Promotion execution failed for '{ticket_id}': "
+                f"{fetch.stderr.strip()}"
+            )
+
+        audit["result"] = "executed"
+        audit["detail"] = (
+            f"Branch '{branch}' ({source_commit[:8]}) "
+            f"fetched into {prod_path}"
+        )
+        if fetch.stderr.strip():
+            audit["git_output"] = fetch.stderr.strip()
+
+        _append_audit_record(cfg, ticket_id, audit)
+        update_promotion_status(cfg, ticket_id, "executed")
+
+        write_log(cfg, "orchestrator", ticket_id,
+                  f"Promotion executed: branch '{branch}' fetched into prod_repo")
+        return audit
+
+    except subprocess.TimeoutExpired:
+        audit["result"] = "failed"
+        audit["detail"] = "Git fetch operation timed out (120s)"
+        _append_audit_record(cfg, ticket_id, audit)
+        update_promotion_status(cfg, ticket_id, "failed")
+        raise RuntimeError(
+            f"Promotion execution timed out for '{ticket_id}'"
+        )

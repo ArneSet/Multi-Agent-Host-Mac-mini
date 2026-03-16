@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `main` (Sprint 4)  
+> **Branch:** `main` (Sprint 5)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 4 — Physical Repo Separation & Promotion Safety  
+> **Status:** Sprint 5 — QA Gate, Manual Promotion Execution, Audit Trail  
 
 ---
 
@@ -301,7 +301,9 @@ Beide Game-Repos sind Clones von `agentavis-ai/HYBRIS---Mortal-Realm.git`.
 | `resolve_prod_repo(cfg)` | Gibt `prod_repo` zurück — nur für Promotion |
 | `validate_repo_target(cfg, target, allow_prod)` | Blockiert `prod_repo` als Agent-Ziel |
 | `validate_repo_separation(cfg)` | Prüft physische Trennung via `Path.resolve()` — **Sprint 4** |
-| `check_promotion_readiness(cfg, ticket_id)` | 5-Punkt-Readiness-Check vor Promotion — **Sprint 4** |
+| `check_promotion_readiness(cfg, ticket_id)` | 6-Punkt-Readiness-Check vor Promotion — **Sprint 5** |
+| `create_qa_result(cfg, ticket_id, passed, notes)` | QA-Ergebnis aufzeichnen (immutabel) — **Sprint 5** |
+| `execute_promotion(cfg, ticket_id, dry_run)` | Git fetch von test_repo → prod_repo — **Sprint 5** |
 | `dispatch_worker()` | Setzt `_agent_repo` im Worker-Config auf `test_repo` |
 
 ### Autoritätsmatrix
@@ -341,9 +343,15 @@ Ticket in review
 4. Promotion ist **nie automatisch** — Creative Director muss genehmigen
 5. `--dry-run` bei Promotion schreibt keine Datei
 6. **Repo-Separation** wird vor jeder Promotion geprüft (`validate_repo_separation`) — **Sprint 4**
-7. **Readiness-Check** prüft 5 Bedingungen vor Promotion-Erstellung — **Sprint 4**
+7. **Readiness-Check** prüft 6 Bedingungen vor Promotion-Erstellung — **Sprint 5** (inkl. QA)
+8. **QA-Gate** muss bestanden sein, bevor Promotion erstellt wird — **Sprint 5**
+9. **Execution** nur mit explizitem `--execute` Flag — **Sprint 5**
+10. **Audit-Record** für jeden Promotion-Versuch (Preview + Execute) — **Sprint 5**
 
-> Promotion Safety: [docs/promotion-safety.md](docs/promotion-safety.md)
+> Promotion Safety: [docs/promotion-safety.md](docs/promotion-safety.md)  
+> QA Gate: [docs/qa-gate.md](docs/qa-gate.md)  
+> Manual Promotion: [docs/manual-promotion-execution.md](docs/manual-promotion-execution.md)  
+> Audit Trail: [docs/promotion-audit-trail.md](docs/promotion-audit-trail.md)
 
 ### CLI-Befehle
 
@@ -354,7 +362,14 @@ Ticket in review
 | `reject TICKET_ID` | Ticket ablehnen |
 | `reticket TICKET_ID` | Ticket zurückgeben (neuer Scope) |
 | `promote TICKET_ID` | Promotion-Request erstellen |
-| `promotion-check TICKET_ID` | Readiness-Check vor Promotion — **Sprint 4** |
+| `promote TICKET_ID --preview` | Promotion-Execution Vorschau — **Sprint 5** |
+| `promote TICKET_ID --execute` | Promotion ausführen (git fetch) — **Sprint 5** |
+| `promotion-check TICKET_ID` | Readiness-Check vor Promotion |
+| `qa-pass TICKET_ID` | QA als bestanden markieren — **Sprint 5** |
+| `qa-fail TICKET_ID` | QA als fehlgeschlagen markieren — **Sprint 5** |
+| `qa-check TICKET_ID` | QA-Status anzeigen — **Sprint 5** |
+| `promotion-status TICKET_ID` | Promotion-Status anzeigen — **Sprint 5** |
+| `audit-show TICKET_ID` | Audit-Trail anzeigen — **Sprint 5** |
 | `repo-targets` | Konfigurierte Repo-Targets anzeigen (mit Separation-Status) |
 
 ---
@@ -371,7 +386,7 @@ hybris-host/
 ├── cli.py                             ← CLI-Entrypoint
 ├── config.json                        ← Lokale Config (gitignored)
 ├── config.example.json                ← Config-Template
-├── test_orchestrator.py               ← Unit Tests (66 Tests)
+├── test_orchestrator.py               ← Unit Tests (86 Tests)
 ├── ticket_schema.md                   ← Ticket-Format-Referenz
 ├── docs/
 │   ├── domain-model.md                ← Domain Model
@@ -382,7 +397,11 @@ hybris-host/
 │   ├── repo-authority-boundaries.md   ← Repo Authority (Sprint 3)
 │   ├── physical-repo-separation.md    ← Physische Trennung (Sprint 4)
 │   ├── promotion-safety.md            ← Promotion Safety (Sprint 4)
-│   └── test-vs-prod-operating-rules.md ← Betriebsregeln (Sprint 4)
+│   ├── test-vs-prod-operating-rules.md ← Betriebsregeln (Sprint 4)
+│   ├── qa-gate.md                     ← QA Gate (Sprint 5)
+│   ├── manual-promotion-execution.md  ← Manuelle Promotion (Sprint 5)
+│   ├── promotion-audit-trail.md       ← Audit Trail (Sprint 5)
+│   └── external-intake-readiness.md   ← Intake-Readiness (Sprint 5)
 └── workers/
     ├── __init__.py
     ├── base_worker.py
@@ -409,6 +428,7 @@ hybris-host/
 ├── artifacts/          ← Worker-Ausgaben
 ├── reviews/            ← ReviewPackages + ApprovalDecisions
 ├── promotions/         ← PromotionRequests
+│   └── audit/          ← Promotion Audit Trail (JSONL)
 ├── sessions/           ← (zukünftig)
 └── locks/              ← fcntl Lock-Files pro Ticket
 ```
@@ -465,8 +485,22 @@ hybris-host/
 ### Promotions
 
 - **PromotionRequest:** `promotions/<ticket_id>.promotion.json` — Promotion von test_repo → prod_repo
-- **Erfordert:** Approved ApprovalDecision
-- **Status:** `pending` (erstellt), `dry_run` (Simulation)
+- **Status:** `pending → previewed → executed` (oder `failed`)
+- **Status-History:** Array von Statusübergängen mit Timestamps
+- **Erfordert:** Approved ApprovalDecision + QA passed
+
+### QA Results
+
+- **QA-Ergebnis:** `reviews/<ticket_id>.qa.json` — Immutables QA-Validierungsergebnis
+- **Erzeugt durch:** `create_qa_result()` (via `qa-pass` / `qa-fail` CLI)
+- **Immutabel:** Einmal gesetzt, nicht änderbar
+
+### Promotion Audit Trail
+
+- **Audit-Datei:** `promotions/audit/<ticket_id>.audit.jsonl` — JSONL-Format
+- **Erzeugt durch:** `execute_promotion()` (Preview + Execute)
+- **Append-only:** Neue Records werden angehängt, nie geändert
+- **Inhalt:** ticket_id, source/target repo, branch, commit, action, result, timestamp
 
 ---
 
@@ -484,7 +518,10 @@ hybris-host/
 | Repo Access | `validate_repo_target()` — Agents blocked from prod_repo | ✓ |
 | Repo Separation | `validate_repo_separation()` — test≠prod via Path.resolve() | ✓ |
 | Promotion | Requires approved ApprovalDecision, immutable records | ✓ |
-| Promotion Readiness | `check_promotion_readiness()` — 5-point check before promotion | ✓ |
+| Promotion Readiness | `check_promotion_readiness()` — 6-point check before promotion | ✓ |
+| QA Gate | `create_qa_result()` — immutable QA validation before promotion | ✓ |
+| Promotion Execution | `execute_promotion()` — explicit `--execute` flag required | ✓ |
+| Promotion Audit | `_append_audit_record()` — every attempt recorded in JSONL | ✓ |
 
 ### Concurrency
 
@@ -530,10 +567,13 @@ hybris-host/
 | 9 | Kein Retry-Counter / Max-Retries | Niedrig | Sprint 3 |
 | 10 | ~~Desktop-Pfad im Game Repo noch nicht migriert~~ | ~~Betriebsrisiko~~ | ✅ Sprint 4: Config zeigt auf physische Clones |
 | 11 | ~~test_repo und prod_repo zeigen auf gleichen Pfad~~ | ~~Betriebsrisiko~~ | ✅ Sprint 4: Physisch getrennt + validate_repo_separation() |
-| 12 | Promotion führt noch keine Git-Operationen aus | Erwartungsgemäß | Sprint 5 |
-| 13 | Kein QA-Gate zwischen active und review | Erwartungsgemäß | Sprint 5 |
-| 14 | Promotion Readiness prüft, führt aber nicht aus | Erwartungsgemäß | Sprint 5: Automated promotion |
+| 12 | ~~Promotion führt noch keine Git-Operationen aus~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 5: execute_promotion() mit git fetch |
+| 13 | ~~Kein QA-Gate zwischen active und review~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 5: QA-Gate als Promotion-Vorbedingung |
+| 14 | ~~Promotion Readiness prüft, führt aber nicht aus~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 5: --preview und --execute implementiert |
 | 15 | Legacy hybris-game Symlink noch vorhanden | Niedrig | Manuelles Cleanup |
+| 16 | Promotion führt kein git merge/push aus | Erwartungsgemäß | CD manuell |
+| 17 | Kein Operator-Identity in Audit Records | Niedrig | Multi-User Sprint |
+| 18 | Audit Trail nicht kryptographisch signiert | Niedrig | — |
 
 ---
 
@@ -548,6 +588,7 @@ hybris-host/
 | 2026-03-16 | `fb8f959` | Sprint 3: Dual Repo Promotion Architecture (squash merge) |
 | 2026-03-16 | `v0.3.0` | Tag: Sprint 3 Release |
 | 2026-03-16 | — | Sprint 4: Physical Repo Separation & Promotion Safety (this branch) |
+| 2026-03-16 | — | Sprint 5: QA Gate, Manual Promotion Execution, Audit Trail (this branch) |
 
 ---
 
@@ -558,3 +599,4 @@ hybris-host/
 | 2026-03-16 | Sprint 2 Agent | Erstversion: System Reference, Domain Model, Ticket Lifecycle, Roles & Authority |
 | 2026-03-16 | Sprint 3 Agent | Dual Repo Architecture, Promotion Flow, Repo Authority, CLI-Erweiterung, 22 neue Tests |
 | 2026-03-16 | Sprint 4 Agent | Physical Repo Separation, Promotion Safety, Readiness Check, 3 neue Docs, 10 neue Tests (66 total) |
+| 2026-03-16 | Sprint 5 Agent | QA Gate, Manual Promotion Execution, Promotion Status Tracking, Audit Trail, 4 neue Docs, 20 neue Tests (86 total) |

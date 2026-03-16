@@ -13,8 +13,13 @@ Usage:
     python3 cli.py approve TICKET_ID [--reason REASON]
     python3 cli.py reject TICKET_ID [--reason REASON]
     python3 cli.py reticket TICKET_ID [--reason REASON]
-    python3 cli.py promote TICKET_ID [--dry-run]
+    python3 cli.py qa-pass TICKET_ID [--notes TEXT]
+    python3 cli.py qa-fail TICKET_ID [--notes TEXT]
+    python3 cli.py qa-check TICKET_ID
+    python3 cli.py promote TICKET_ID [--dry-run | --preview | --execute]
     python3 cli.py promotion-check TICKET_ID
+    python3 cli.py promotion-status TICKET_ID
+    python3 cli.py audit-show TICKET_ID
 """
 
 import argparse
@@ -37,8 +42,14 @@ from orchestrator import (
     load_review_package,
     create_approval_decision,
     load_approval_decision,
+    create_qa_result,
+    load_qa_result,
     check_promotion_readiness,
     create_promotion_request,
+    load_promotion_request,
+    update_promotion_status,
+    execute_promotion,
+    load_audit_trail,
 )
 
 _HERE = Path(__file__).resolve().parent
@@ -291,21 +302,50 @@ def cmd_reticket(cfg, args):
 
 
 def cmd_promote(cfg, args):
-    """Create a promotion request for an approved ticket."""
-    try:
-        request = create_promotion_request(cfg, args.ticket_id,
-                                           dry_run=args.dry_run)
-        prefix = "[DRY-RUN] " if args.dry_run else ""
-        print(f"{prefix}PROMOTION REQUEST: {args.ticket_id}")
-        print(f"  Branch:    {request.get('branch', '?')}")
-        print(f"  Source:    {request.get('source_repo', '?')} → {request.get('source_path', '?')}")
-        print(f"  Target:    {request.get('target_repo', '?')} → {request.get('target_path', '?')}")
-        print(f"  Status:    {request.get('status', '?')}")
-        print(f"  Requested: {request.get('requested_at', '?')}")
-        return 0
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
-        print(f"ERROR: {e}")
-        return 1
+    """Create a promotion request, preview, or execute promotion."""
+    if args.preview:
+        try:
+            audit = execute_promotion(cfg, args.ticket_id, dry_run=True)
+            print(f"PROMOTION PREVIEW: {args.ticket_id}")
+            print(f"  Branch:  {audit.get('branch', '?')}")
+            print(f"  Source:  {audit.get('source_repo', '?')}")
+            print(f"  Target:  {audit.get('target_repo', '?')}")
+            print(f"  Commit:  {audit.get('source_commit', '?')}")
+            print(f"  Plan:    {audit.get('detail', '?')}")
+            print(f"  Status:  previewed (no changes made)")
+            return 0
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f"ERROR: {e}")
+            return 1
+    elif args.execute:
+        try:
+            audit = execute_promotion(cfg, args.ticket_id, dry_run=False)
+            print(f"PROMOTION EXECUTED: {args.ticket_id}")
+            print(f"  Branch:  {audit.get('branch', '?')}")
+            print(f"  Source:  {audit.get('source_repo', '?')}")
+            print(f"  Target:  {audit.get('target_repo', '?')}")
+            print(f"  Commit:  {audit.get('source_commit', '?')}")
+            print(f"  Result:  {audit.get('result', '?')}")
+            print(f"  Detail:  {audit.get('detail', '?')}")
+            return 0
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f"ERROR: {e}")
+            return 1
+    else:
+        try:
+            request = create_promotion_request(cfg, args.ticket_id,
+                                               dry_run=args.dry_run)
+            prefix = "[DRY-RUN] " if args.dry_run else ""
+            print(f"{prefix}PROMOTION REQUEST: {args.ticket_id}")
+            print(f"  Branch:    {request.get('branch', '?')}")
+            print(f"  Source:    {request.get('source_repo', '?')} → {request.get('source_path', '?')}")
+            print(f"  Target:    {request.get('target_repo', '?')} → {request.get('target_path', '?')}")
+            print(f"  Status:    {request.get('status', '?')}")
+            print(f"  Requested: {request.get('requested_at', '?')}")
+            return 0
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f"ERROR: {e}")
+            return 1
 
 
 def cmd_promotion_check(cfg, args):
@@ -323,6 +363,99 @@ def cmd_promotion_check(cfg, args):
         print(f"ERROR: {e}")
         return 1
 
+def cmd_qa_pass(cfg, args):
+    """Mark QA as passed for a ticket."""
+    try:
+        record = create_qa_result(cfg, args.ticket_id, True,
+                                  notes=args.notes or "")
+        print(f"QA PASSED: {args.ticket_id}")
+        print(f"  Validated at: {record['validated_at']}")
+        if args.notes:
+            print(f"  Notes: {args.notes}")
+        return 0
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
+def cmd_qa_fail(cfg, args):
+    """Mark QA as failed for a ticket."""
+    try:
+        record = create_qa_result(cfg, args.ticket_id, False,
+                                  notes=args.notes or "")
+        print(f"QA FAILED: {args.ticket_id}")
+        print(f"  Validated at: {record['validated_at']}")
+        if args.notes:
+            print(f"  Notes: {args.notes}")
+        return 0
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
+def cmd_qa_check(cfg, args):
+    """Show QA status for a ticket."""
+    try:
+        qa = load_qa_result(cfg, args.ticket_id)
+        status = "PASSED" if qa.get("passed") else "FAILED"
+        print(f"QA Status: {args.ticket_id}")
+        print(f"  Result:    {status}")
+        print(f"  Validated: {qa.get('validated_at', '?')}")
+        print(f"  Validator: {qa.get('validator', '?')}")
+        if qa.get("notes"):
+            print(f"  Notes:     {qa['notes']}")
+        return 0 if qa.get("passed") else 1
+    except FileNotFoundError:
+        print(f"QA Status: {args.ticket_id}")
+        print("  Result: NOT YET VALIDATED")
+        print("  Use 'qa-pass' or 'qa-fail' to record a QA result.")
+        return 1
+
+
+def cmd_promotion_status(cfg, args):
+    """Show promotion status for a ticket."""
+    try:
+        request = load_promotion_request(cfg, args.ticket_id)
+        print(f"Promotion Status: {args.ticket_id}")
+        print(f"  Status:    {request.get('status', '?')}")
+        print(f"  Branch:    {request.get('branch', '?')}")
+        print(f"  Source:    {request.get('source_repo', '?')} \u2192 {request.get('source_path', '?')}")
+        print(f"  Target:    {request.get('target_repo', '?')} \u2192 {request.get('target_path', '?')}")
+        print(f"  Requested: {request.get('requested_at', '?')}")
+        if request.get("updated_at"):
+            print(f"  Updated:   {request['updated_at']}")
+        if request.get("status_history"):
+            print("  History:")
+            for entry in request["status_history"]:
+                print(f"    {entry.get('at', '?')}: {entry.get('status', '?')}")
+        return 0
+    except FileNotFoundError:
+        print(f"No promotion request found for: {args.ticket_id}")
+        return 1
+
+
+def cmd_audit_show(cfg, args):
+    """Show audit trail for a ticket."""
+    records = load_audit_trail(cfg, args.ticket_id)
+    if not records:
+        print(f"No audit records found for: {args.ticket_id}")
+        return 0
+
+    print(f"Audit Trail: {args.ticket_id}")
+    print(f"  Records: {len(records)}")
+    print()
+    for i, r in enumerate(records, 1):
+        print(f"  [{i}] {r.get('timestamp', '?')} \u2014 {r.get('action', '?')}")
+        print(f"      Result: {r.get('result', '?')}")
+        print(f"      Branch: {r.get('branch', '?')}")
+        print(f"      Source: {r.get('source_repo', '?')}")
+        print(f"      Target: {r.get('target_repo', '?')}")
+        if r.get('detail'):
+            print(f"      Detail: {r['detail']}")
+        if r.get('dry_run') is not None:
+            print(f"      Dry-run: {r['dry_run']}")
+        print()
+    return 0
 
 def main():
     parser = argparse.ArgumentParser(
@@ -377,13 +510,42 @@ def main():
     p_reticket.add_argument("--reason", default="", help="Reticket reason")
 
     # promote
-    p_promote = sub.add_parser("promote", help="Create promotion request for approved ticket")
+    p_promote = sub.add_parser("promote", help="Create, preview, or execute promotion")
     p_promote.add_argument("ticket_id", help="Ticket ID")
-    p_promote.add_argument("--dry-run", action="store_true", help="Simulate without writing files")
+    promote_group = p_promote.add_mutually_exclusive_group()
+    promote_group.add_argument("--dry-run", action="store_true",
+                               help="Simulate request creation")
+    promote_group.add_argument("--preview", action="store_true",
+                               help="Preview promotion execution (no changes)")
+    promote_group.add_argument("--execute", action="store_true",
+                               help="Execute promotion (fetch branch into prod_repo)")
 
     # promotion-check
-    p_promcheck = sub.add_parser("promotion-check", help="Check promotion readiness for a ticket")
+    p_promcheck = sub.add_parser("promotion-check", help="Check promotion readiness")
     p_promcheck.add_argument("ticket_id", help="Ticket ID")
+
+    # qa-pass
+    p_qa_pass = sub.add_parser("qa-pass", help="Mark QA as passed for a ticket")
+    p_qa_pass.add_argument("ticket_id", help="Ticket ID")
+    p_qa_pass.add_argument("--notes", default="", help="QA notes")
+
+    # qa-fail
+    p_qa_fail = sub.add_parser("qa-fail", help="Mark QA as failed for a ticket")
+    p_qa_fail.add_argument("ticket_id", help="Ticket ID")
+    p_qa_fail.add_argument("--notes", default="", help="QA notes")
+
+    # qa-check
+    p_qa_check = sub.add_parser("qa-check", help="Show QA status for a ticket")
+    p_qa_check.add_argument("ticket_id", help="Ticket ID")
+
+    # promotion-status
+    p_promstatus = sub.add_parser("promotion-status",
+                                   help="Show promotion status for a ticket")
+    p_promstatus.add_argument("ticket_id", help="Ticket ID")
+
+    # audit-show
+    p_audit = sub.add_parser("audit-show", help="Show audit trail for a ticket")
+    p_audit.add_argument("ticket_id", help="Ticket ID")
 
     args = parser.parse_args()
     cfg = load_config()
@@ -401,6 +563,11 @@ def main():
         "reticket": cmd_reticket,
         "promote": cmd_promote,
         "promotion-check": cmd_promotion_check,
+        "qa-pass": cmd_qa_pass,
+        "qa-fail": cmd_qa_fail,
+        "qa-check": cmd_qa_check,
+        "promotion-status": cmd_promotion_status,
+        "audit-show": cmd_audit_show,
     }
 
     return commands[args.command](cfg, args)
