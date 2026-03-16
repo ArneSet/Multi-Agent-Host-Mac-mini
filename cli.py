@@ -38,6 +38,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from orchestrator import (
@@ -710,29 +711,40 @@ def cmd_whatsapp_validate(cfg, args):
     return 0
 
 
-def cmd_whatsapp_simulate(cfg, args):
-    """Simulate a WhatsApp message through the connector."""
-    sender = args.sender
-    message = args.message
+def cmd_whatsapp_simulate_batch(cfg, args):
+    """Simulate a WhatsApp batch webhook with multiple messages."""
+    # Parse messages from format "sender:text"
+    messages = []
+    for msg_str in args.messages:
+        if ":" not in msg_str:
+            print(f"ERROR: Invalid message format: {msg_str} (expected sender:text)")
+            return 1
+        sender, text = msg_str.split(":", 1)
+        messages.append({"sender": sender, "text": text})
 
-    print(f"Simulating WhatsApp message from {sender}")
-    print(f"Message: {message}")
+    print(f"Simulating WhatsApp batch with {len(messages)} messages")
+    for i, msg in enumerate(messages, 1):
+        print(f"  [{i}] From {msg['sender']}: {msg['text']}")
     print()
 
-    # Create mock webhook payload
+    # Create mock webhook payload with multiple messages
+    mock_messages = []
+    for i, msg in enumerate(messages):
+        mock_messages.append({
+            "id": f"mock_batch_{int(time.time())}_{i}",
+            "from": msg["sender"],
+            "timestamp": str(int(time.time()) + i),
+            "type": "text",
+            "text": {"body": msg["text"]}
+        })
+
     mock_payload = {
         "object": "whatsapp_business_account",
         "entry": [{
             "changes": [{
                 "field": "messages",
                 "value": {
-                    "messages": [{
-                        "id": f"mock_{int(time.time())}",
-                        "from": sender,
-                        "timestamp": str(int(time.time())),
-                        "type": "text",
-                        "text": {"body": message}
-                    }]
+                    "messages": mock_messages
                 }
             }]
         }]
@@ -740,19 +752,47 @@ def cmd_whatsapp_simulate(cfg, args):
 
     payload_bytes = json.dumps(mock_payload).encode("utf-8")
 
+    # Enable WhatsApp for simulation and allow unsigned webhooks
+    if "whatsapp" not in cfg:
+        cfg["whatsapp"] = {}
+    cfg["whatsapp"]["enabled"] = True
+    cfg["whatsapp"]["allow_unsigned_webhooks"] = True
+    cfg["whatsapp"]["authorized_senders"] = ["+1234567890"]  # Add test sender
+    cfg["whatsapp"]["verify_token"] = "test_verify_token"
+    cfg["whatsapp"]["access_token"] = "test_access_token"
+
+    # Enable intake for WhatsApp
+    if "intake" not in cfg:
+        cfg["intake"] = {}
+    cfg["intake"]["trusted_sources"] = ["whatsapp"]
+
     # Process through connector
     result = process_whatsapp_webhook(cfg, payload_bytes)
 
-    print(f"Processing result: {result['status']}")
+    print(f"Batch processing result: {result['status']}")
+    print(f"Batch size: {result.get('batch_size', 0)}")
+    print(f"Processed: {result.get('processed_messages', 0)}")
+    print(f"Admitted: {result.get('admitted_count', 0)}")
+    print(f"Rejected: {result.get('rejected_count', 0)}")
+    print(f"Duplicates: {result.get('duplicate_count', 0)}")
+    print(f"Rate limited: {result.get('rate_limited_count', 0)}")
     if result.get("detail"):
         print(f"Detail: {result['detail']}")
-    if result.get("intake_result"):
-        intake = result["intake_result"]
-        print(f"Intake status: {intake.get('status')}")
-        if intake.get("ticket_path"):
-            print(f"Ticket created: {intake['ticket_path']}")
+    print()
 
-    return 0 if result["status"] == "admitted" else 1
+    # Show per-message results
+    if result.get("message_results"):
+        print("Per-message results:")
+        for i, msg_result in enumerate(result["message_results"], 1):
+            status = msg_result.get("status", "unknown")
+            msg_id = msg_result.get("message_id", "unknown")
+            sender = msg_result.get("sender", "unknown")
+            detail = msg_result.get("detail", "")
+            print(f"  [{i}] {status.upper()}: {msg_id} from {sender}")
+            if detail:
+                print(f"      {detail}")
+
+    return 0 if result["status"] in ("admitted", "processed") else 1
 
 
 def cmd_whatsapp_status(cfg, args):
@@ -966,6 +1006,11 @@ def main():
     p_wsim.add_argument("--sender", required=True, help="Sender phone number")
     p_wsim.add_argument("--message", required=True, help="Message text")
 
+    # whatsapp-simulate-batch
+    p_wsimb = sub.add_parser("whatsapp-simulate-batch", help="Simulate WhatsApp batch")
+    p_wsimb.add_argument("--messages", nargs="+", required=True,
+                         help="Messages in format sender:text (e.g. '+123:hello +456:world')")
+
     # whatsapp-status
     sub.add_parser("whatsapp-status", help="Show WhatsApp connector status")
 
@@ -1005,7 +1050,7 @@ def main():
         "intake-status": cmd_intake_status,
         "whatsapp-config": cmd_whatsapp_config,
         "whatsapp-validate": cmd_whatsapp_validate,
-        "whatsapp-simulate": cmd_whatsapp_simulate,
+        "whatsapp-simulate-batch": cmd_whatsapp_simulate_batch,
         "whatsapp-status": cmd_whatsapp_status,
         "whatsapp-audit-show": cmd_whatsapp_audit_show,
         "whatsapp-allowlist-show": cmd_whatsapp_allowlist_show,

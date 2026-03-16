@@ -139,13 +139,13 @@ def verify_webhook_request(cfg: dict, payload: bytes,
     if not is_whatsapp_enabled(cfg):
         return False, "WhatsApp connector disabled"
 
-    access_token = get_whatsapp_access_token(cfg)
-    if not access_token:
-        return False, "No access token configured"
+    verify_token = get_whatsapp_verify_token(cfg)
+    if not verify_token:
+        return False, "No verify token configured"
 
     if signature:
         # Verify signature if provided
-        if not verify_whatsapp_signature(payload, signature, access_token):
+        if not verify_whatsapp_signature(payload, signature, verify_token):
             return False, "Invalid signature"
     else:
         # For development/testing, allow unsigned if explicitly configured
@@ -174,18 +174,21 @@ def authorize_sender(cfg: dict, sender_number: str) -> Tuple[bool, str]:
 # Message parsing
 # ---------------------------------------------------------------------------
 
-def parse_whatsapp_message(payload: dict) -> Optional[Dict]:
-    """Parse WhatsApp webhook payload into message dict.
+def parse_whatsapp_messages(payload: dict) -> List[Optional[Dict]]:
+    """Parse WhatsApp webhook payload into list of message dicts.
 
-    Returns None if not a valid message.
+    Returns list of message dicts, or empty list if no valid messages.
+    Each message dict contains: id, from, timestamp, type, text
+    Invalid messages in batch return None in their position.
     """
+    messages = []
     try:
         # WhatsApp webhook structure
         if "object" not in payload or payload["object"] != "whatsapp_business_account":
-            return None
+            return []
 
         if "entry" not in payload:
-            return None
+            return []
 
         for entry in payload["entry"]:
             if "changes" not in entry:
@@ -202,26 +205,37 @@ def parse_whatsapp_message(payload: dict) -> Optional[Dict]:
                 if "messages" not in value:
                     continue
 
-                for message in value["messages"]:
-                    msg_type = message.get("type")
-                    if msg_type not in WHATSAPP_MESSAGE_TYPES:
-                        continue
+                # Safety limit: max 10 messages per batch
+                batch_messages = value["messages"][:10]
 
-                    # Only handle text messages in v1
-                    if msg_type != "text":
-                        continue
+                for message in batch_messages:
+                    try:
+                        msg_type = message.get("type")
+                        if msg_type not in WHATSAPP_MESSAGE_TYPES:
+                            messages.append(None)  # Invalid type
+                            continue
 
-                    return {
-                        "id": message["id"],
-                        "from": message["from"],
-                        "timestamp": message["timestamp"],
-                        "type": msg_type,
-                        "text": message.get("text", {}).get("body", ""),
-                    }
+                        # Only handle text messages in v1
+                        if msg_type != "text":
+                            messages.append(None)  # Unsupported type
+                            continue
 
-        return None
+                        parsed_message = {
+                            "id": message["id"],
+                            "from": message["from"],
+                            "timestamp": message["timestamp"],
+                            "type": msg_type,
+                            "text": message.get("text", {}).get("body", ""),
+                        }
+                        messages.append(parsed_message)
+
+                    except (KeyError, TypeError):
+                        messages.append(None)  # Malformed message
+
+        return messages
+
     except (KeyError, TypeError):
-        return None
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -380,51 +394,141 @@ def load_whatsapp_audit(cfg: dict) -> List[Dict]:
 
 def process_whatsapp_webhook(cfg: dict, payload: bytes,
                            signature: Optional[str] = None) -> Dict:
-    """Process incoming WhatsApp webhook.
+    """Process incoming WhatsApp webhook with batch support.
 
-    Returns processing result dict.
+    Returns batch processing result dict with per-message outcomes.
     """
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    batch_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    result = {
-        "timestamp": timestamp,
+    batch_result = {
+        "timestamp": batch_timestamp,
+        "batch_size": 0,
+        "processed_messages": 0,
+        "admitted_count": 0,
+        "rejected_count": 0,
+        "duplicate_count": 0,
+        "rate_limited_count": 0,
+        "message_results": [],
         "status": None,
-        "message_id": None,
-        "sender": None,
+        "detail": None,
+    }
+
+    try:
+        # 1. Verify webhook authenticity (provider level)
+        verified, reason = verify_webhook_request(cfg, payload, signature)
+        if not verified:
+            batch_result["status"] = "rejected"
+            batch_result["detail"] = f"Provider verification failed: {reason}"
+            # Create audit records for all messages in failed payload
+            json_payload = json.loads(payload.decode("utf-8"))
+            messages = parse_whatsapp_messages(json_payload)
+            for i, message in enumerate(messages):
+                if message:
+                    msg_result = {
+                        "timestamp": batch_timestamp,
+                        "message_id": message["id"],
+                        "sender": message["from"],
+                        "status": "rejected",
+                        "detail": f"Provider verification failed: {reason}",
+                        "batch_position": i + 1,
+                        "batch_size": len(messages),
+                    }
+                    _append_whatsapp_audit(cfg, msg_result)
+                    batch_result["message_results"].append(msg_result)
+                    batch_result["rejected_count"] += 1
+            return batch_result
+
+        # 2. Parse all messages in batch
+        json_payload = json.loads(payload.decode("utf-8"))
+        messages = parse_whatsapp_messages(json_payload)
+        batch_result["batch_size"] = len(messages)
+
+        if not messages:
+            batch_result["status"] = "rejected"
+            batch_result["detail"] = "No valid messages found in webhook"
+            _append_whatsapp_audit(cfg, {
+                "timestamp": batch_timestamp,
+                "status": "rejected",
+                "detail": "No valid messages found in webhook"
+            })
+            return batch_result
+
+        # 3. Process each message individually
+        for i, message in enumerate(messages):
+            if message is None:
+                # Malformed or unsupported message
+                msg_result = {
+                    "timestamp": batch_timestamp,
+                    "status": "rejected",
+                    "detail": "Malformed or unsupported message",
+                    "batch_position": i + 1,
+                    "batch_size": len(messages),
+                }
+                _append_whatsapp_audit(cfg, msg_result)
+                batch_result["message_results"].append(msg_result)
+                batch_result["rejected_count"] += 1
+                continue
+
+            # Process valid message
+            msg_result = _process_single_whatsapp_message(cfg, message, batch_timestamp, i + 1, len(messages))
+            batch_result["message_results"].append(msg_result)
+            batch_result["processed_messages"] += 1
+
+            # Update counters
+            if msg_result["status"] == "admitted":
+                batch_result["admitted_count"] += 1
+            elif msg_result["status"] == "rejected":
+                batch_result["rejected_count"] += 1
+            elif msg_result["status"] == "duplicate":
+                batch_result["duplicate_count"] += 1
+            elif msg_result["status"] == "rate_limited":
+                batch_result["rate_limited_count"] += 1
+
+        # 4. Set overall batch status
+        if batch_result["admitted_count"] > 0:
+            batch_result["status"] = "admitted"
+            batch_result["detail"] = f"Batch processed: {batch_result['admitted_count']} admitted, {batch_result['rejected_count']} rejected, {batch_result['duplicate_count']} duplicates, {batch_result['rate_limited_count']} rate limited"
+        elif batch_result["processed_messages"] == 0:
+            batch_result["status"] = "rejected"
+            batch_result["detail"] = "No messages could be processed"
+        else:
+            batch_result["status"] = "processed"
+            batch_result["detail"] = f"Batch processed with no admissions: {batch_result['rejected_count']} rejected, {batch_result['duplicate_count']} duplicates, {batch_result['rate_limited_count']} rate limited"
+
+        return batch_result
+
+    except Exception as e:
+        batch_result["status"] = "failed"
+        batch_result["detail"] = f"Batch processing error: {e}"
+        return batch_result
+
+
+def _process_single_whatsapp_message(cfg: dict, message: Dict, batch_timestamp: str,
+                                   batch_position: int, batch_size: int) -> Dict:
+    """Process a single WhatsApp message within a batch.
+
+    Returns message processing result dict.
+    """
+    result = {
+        "timestamp": batch_timestamp,
+        "message_id": message["id"],
+        "sender": message["from"],
+        "batch_position": batch_position,
+        "batch_size": batch_size,
+        "status": None,
         "detail": None,
         "intake_result": None,
     }
 
     try:
-        # 1. Verify webhook authenticity
-        verified, reason = verify_webhook_request(cfg, payload, signature)
-        if not verified:
-            result["status"] = "rejected"
-            result["detail"] = f"Verification failed: {reason}"
-            _append_whatsapp_audit(cfg, result)
-            return result
-
-        # 2. Parse webhook payload
-        json_payload = json.loads(payload.decode("utf-8"))
-        message = parse_whatsapp_message(json_payload)
-
-        if not message:
-            result["status"] = "rejected"
-            result["detail"] = "No valid message found in webhook"
-            _append_whatsapp_audit(cfg, result)
-            return result
-
-        result["message_id"] = message["id"]
-        result["sender"] = message["from"]
-
-        # 3. Check replay
+        # 1. Check replay (idempotency)
         if check_whatsapp_replay(cfg, message["id"]):
             result["status"] = "duplicate"
             result["detail"] = "Message already processed"
             _append_whatsapp_audit(cfg, result)
             return result
 
-        # 4. Authorize sender
+        # 2. Authorize sender
         authorized, auth_reason = authorize_sender(cfg, message["from"])
         if not authorized:
             result["status"] = "rejected"
@@ -432,17 +536,17 @@ def process_whatsapp_webhook(cfg: dict, payload: bytes,
             _append_whatsapp_audit(cfg, result)
             return result
 
-        # 5. Check rate limit
+        # 3. Check rate limit
         if check_whatsapp_rate_limit(cfg, message["from"]):
             result["status"] = "rate_limited"
             result["detail"] = f"Rate limit exceeded for sender {message['from']}"
             _append_whatsapp_audit(cfg, result)
             return result
 
-        # 6. Normalize message
+        # 4. Normalize message
         normalized = normalize_whatsapp_message(message)
 
-        # 7. Submit to intake
+        # 5. Submit to intake
         from intake import process_intake
         intake_result = process_intake(cfg, "whatsapp", normalized, admit=True)
 
@@ -450,13 +554,13 @@ def process_whatsapp_webhook(cfg: dict, payload: bytes,
         result["detail"] = intake_result.get("detail", "Intake processing completed")
         result["intake_result"] = intake_result
 
-        # 8. Record processing
+        # 6. Record processing
         _record_whatsapp_message_processed(cfg, message["id"])
         _record_whatsapp_rate_event(cfg, message["from"])
 
     except Exception as e:
         result["status"] = "failed"
-        result["detail"] = f"Processing error: {e}"
+        result["detail"] = f"Message processing error: {e}"
 
     _append_whatsapp_audit(cfg, result)
     return result
