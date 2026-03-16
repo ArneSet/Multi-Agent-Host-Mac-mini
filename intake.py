@@ -22,7 +22,7 @@ from pathlib import Path
 
 INTAKE_SOURCES = frozenset([
     "local_simulated",
-    "future_whatsapp",
+    "whatsapp",
     "future_openclaw",
     "future_sms",
     "future_api",
