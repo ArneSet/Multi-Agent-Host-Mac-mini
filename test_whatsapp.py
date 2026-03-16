@@ -32,7 +32,7 @@ from whatsapp import (
     verify_whatsapp_signature,
     verify_webhook_request,
     authorize_sender,
-    parse_whatsapp_message,
+    parse_whatsapp_messages,
     check_whatsapp_replay,
     check_whatsapp_rate_limit,
     normalize_whatsapp_message,
@@ -189,7 +189,9 @@ class TestMessageParsing(WhatsAppTestBase):
             }]
         }
 
-        message = parse_whatsapp_message(payload)
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
         self.assertIsNotNone(message)
         self.assertEqual(message["id"], "test_msg_id")
         self.assertEqual(message["from"], "+1234567890")
@@ -214,13 +216,14 @@ class TestMessageParsing(WhatsAppTestBase):
             }]
         }
 
-        message = parse_whatsapp_message(payload)
-        self.assertIsNone(message)
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 1)  # Returns list with None for unsupported
+        self.assertIsNone(messages[0])
 
     def test_parse_invalid_payload(self):
         payload = {"invalid": "structure"}
-        message = parse_whatsapp_message(payload)
-        self.assertIsNone(message)
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 0)
 
 
 class TestIdempotency(WhatsAppTestBase):
@@ -310,8 +313,12 @@ class TestWebhookProcessing(WhatsAppTestBase):
         result = process_whatsapp_webhook(self.config, payload_bytes)
 
         self.assertEqual(result["status"], "admitted")
-        self.assertEqual(result["sender"], "+1234567890")
-        self.assertEqual(result["message_id"], "test_msg_123")
+        self.assertEqual(result["admitted_count"], 1)
+        self.assertEqual(len(result["message_results"]), 1)
+        msg_result = result["message_results"][0]
+        self.assertEqual(msg_result["status"], "admitted")
+        self.assertEqual(msg_result["sender"], "+1234567890")
+        self.assertEqual(msg_result["message_id"], "test_msg_123")
 
     def test_process_unauthorized_sender(self):
         payload = {
@@ -337,8 +344,13 @@ class TestWebhookProcessing(WhatsAppTestBase):
 
         result = process_whatsapp_webhook(self.config, payload_bytes)
 
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("not in authorized list", result["detail"])
+        self.assertEqual(result["status"], "processed")  # No admissions, but processed
+        self.assertEqual(result["admitted_count"], 0)
+        self.assertEqual(result["rejected_count"], 1)
+        self.assertEqual(len(result["message_results"]), 1)
+        msg_result = result["message_results"][0]
+        self.assertEqual(msg_result["status"], "rejected")
+        self.assertIn("not in authorized list", msg_result["detail"])
 
     def test_process_duplicate_message(self):
         payload = {
@@ -365,10 +377,16 @@ class TestWebhookProcessing(WhatsAppTestBase):
         # First time - should work
         result1 = process_whatsapp_webhook(self.config, payload_bytes)
         self.assertEqual(result1["status"], "admitted")
+        self.assertEqual(result1["admitted_count"], 1)
 
         # Second time - duplicate
         result2 = process_whatsapp_webhook(self.config, payload_bytes)
-        self.assertEqual(result2["status"], "duplicate")
+        self.assertEqual(result2["status"], "processed")  # No admissions due to duplicate
+        self.assertEqual(result2["admitted_count"], 0)
+        self.assertEqual(result2["duplicate_count"], 1)
+        self.assertEqual(len(result2["message_results"]), 1)
+        msg_result = result2["message_results"][0]
+        self.assertEqual(msg_result["status"], "duplicate")
 
 
 class TestAuditTrail(WhatsAppTestBase):
@@ -466,6 +484,399 @@ class TestSafetyGuarantees(WhatsAppTestBase):
 
         self.assertEqual(result["status"], "admitted")
         # No repo operations should have occurred
+
+
+class TestBatchMessageParsing(WhatsAppTestBase):
+    """Test batch message parsing (Sprint 8)."""
+
+    def test_parse_single_message_batch(self):
+        """Test parsing a batch with one message."""
+        from whatsapp import parse_whatsapp_messages
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [{
+                            "id": "batch_msg_1",
+                            "from": "+1234567890",
+                            "timestamp": "1234567890",
+                            "type": "text",
+                            "text": {"body": "Single message"}
+                        }]
+                    }
+                }]
+            }]
+        }
+
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["id"], "batch_msg_1")
+        self.assertEqual(messages[0]["text"], "Single message")
+
+    def test_parse_multiple_messages_batch(self):
+        """Test parsing a batch with multiple messages."""
+        from whatsapp import parse_whatsapp_messages
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "batch_msg_1",
+                                "from": "+1234567890",
+                                "timestamp": "1234567890",
+                                "type": "text",
+                                "text": {"body": "First message"}
+                            },
+                            {
+                                "id": "batch_msg_2",
+                                "from": "+1234567890",
+                                "timestamp": "1234567891",
+                                "type": "text",
+                                "text": {"body": "Second message"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["id"], "batch_msg_1")
+        self.assertEqual(messages[1]["id"], "batch_msg_2")
+
+    def test_parse_empty_batch(self):
+        """Test parsing a batch with no messages."""
+        from whatsapp import parse_whatsapp_messages
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": []
+                    }
+                }]
+            }]
+        }
+
+        messages = parse_whatsapp_messages(payload)
+        self.assertEqual(len(messages), 0)
+
+    def test_parse_mixed_message_types_batch(self):
+        """Test parsing batch with supported and unsupported message types."""
+        from whatsapp import parse_whatsapp_messages
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "text_msg",
+                                "from": "+1234567890",
+                                "timestamp": "1234567890",
+                                "type": "text",
+                                "text": {"body": "Text message"}
+                            },
+                            {
+                                "id": "image_msg",
+                                "from": "+1234567890",
+                                "timestamp": "1234567891",
+                                "type": "image",
+                                "image": {"id": "img_123"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        messages = parse_whatsapp_messages(payload)
+        # Should return list with valid message and None for invalid
+        self.assertEqual(len(messages), 2)
+        self.assertIsNotNone(messages[0])
+        self.assertEqual(messages[0]["id"], "text_msg")
+        self.assertIsNone(messages[1])  # Unsupported type
+
+
+class TestBatchWebhookProcessing(WhatsAppTestBase):
+    """Test batch webhook processing (Sprint 8)."""
+
+    def test_process_batch_all_valid(self):
+        """Test processing a batch where all messages are valid."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "batch_valid_1",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time())),
+                                "type": "text",
+                                "text": {"body": "Valid message 1"}
+                            },
+                            {
+                                "id": "batch_valid_2",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time()) + 1),
+                                "type": "text",
+                                "text": {"body": "Valid message 2"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        result = process_whatsapp_webhook(self.config, payload_bytes)
+
+        # Should return batch result with individual message results
+        self.assertEqual(result["status"], "admitted")
+        self.assertIn("message_results", result)
+        self.assertEqual(len(result["message_results"]), 2)
+
+        # Both messages should be admitted
+        for msg_result in result["message_results"]:
+            self.assertEqual(msg_result["status"], "admitted")
+
+    def test_process_batch_mixed_validity(self):
+        """Test processing batch with mix of valid and invalid messages."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "batch_valid",
+                                "from": "+1234567890",  # Authorized
+                                "timestamp": str(int(time.time())),
+                                "type": "text",
+                                "text": {"body": "Valid message"}
+                            },
+                            {
+                                "id": "batch_unauthorized",
+                                "from": "+9999999999",  # Not authorized
+                                "timestamp": str(int(time.time()) + 1),
+                                "type": "text",
+                                "text": {"body": "Unauthorized message"}
+                            },
+                            {
+                                "id": "batch_unsupported",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time()) + 2),
+                                "type": "image",  # Unsupported type
+                                "image": {"id": "img_123"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        result = process_whatsapp_webhook(self.config, payload_bytes)
+
+        self.assertEqual(result["status"], "admitted")
+        self.assertEqual(len(result["message_results"]), 3)
+
+        # Check individual results - find by batch position since some may not have message_id
+        valid_result = None
+        unauthorized_result = None
+        unsupported_result = None
+
+        for msg_result in result["message_results"]:
+            if msg_result.get("message_id") == "batch_valid":
+                valid_result = msg_result
+            elif msg_result.get("message_id") == "batch_unauthorized":
+                unauthorized_result = msg_result
+            elif "Malformed or unsupported message" in msg_result.get("detail", ""):
+                unsupported_result = msg_result
+
+        self.assertIsNotNone(valid_result)
+        self.assertIsNotNone(unauthorized_result)
+        self.assertIsNotNone(unsupported_result)
+
+        self.assertEqual(valid_result["status"], "admitted")
+        self.assertEqual(unauthorized_result["status"], "rejected")
+        self.assertIn("not in authorized list", unauthorized_result["detail"])
+        self.assertEqual(unsupported_result["status"], "rejected")
+        self.assertIn("Malformed or unsupported message", unsupported_result["detail"])
+
+    def test_process_batch_with_duplicates(self):
+        """Test batch processing with duplicate messages."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "duplicate_msg",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time())),
+                                "type": "text",
+                                "text": {"body": "First instance"}
+                            },
+                            {
+                                "id": "duplicate_msg",  # Same ID
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time()) + 1),
+                                "type": "text",
+                                "text": {"body": "Duplicate instance"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        result = process_whatsapp_webhook(self.config, payload_bytes)
+
+        self.assertEqual(result["status"], "admitted")
+        self.assertEqual(len(result["message_results"]), 2)
+
+        # First should be admitted, second should be duplicate
+        results_by_index = result["message_results"]
+        self.assertEqual(results_by_index[0]["status"], "admitted")
+        self.assertEqual(results_by_index[1]["status"], "duplicate")
+
+    def test_process_empty_batch(self):
+        """Test processing a batch with no messages."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": []
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        result = process_whatsapp_webhook(self.config, payload_bytes)
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(len(result["message_results"]), 0)
+
+
+class TestBatchAuditTrail(WhatsAppTestBase):
+    """Test audit trail for batch processing (Sprint 8)."""
+
+    def test_batch_audit_records(self):
+        """Test that batch processing creates individual audit records."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "audit_batch_1",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time())),
+                                "type": "text",
+                                "text": {"body": "Audit message 1"}
+                            },
+                            {
+                                "id": "audit_batch_2",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time()) + 1),
+                                "type": "text",
+                                "text": {"body": "Audit message 2"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        process_whatsapp_webhook(self.config, payload_bytes)
+
+        records = load_whatsapp_audit(self.config)
+        self.assertEqual(len(records), 2)
+
+        # Check that both messages are recorded
+        message_ids = {r["message_id"] for r in records}
+        self.assertEqual(message_ids, {"audit_batch_1", "audit_batch_2"})
+
+        # Both should be admitted
+        for record in records:
+            self.assertEqual(record["status"], "admitted")
+
+    def test_batch_audit_mixed_results(self):
+        """Test audit trail for batch with mixed success/failure."""
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "audit_valid",
+                                "from": "+1234567890",
+                                "timestamp": str(int(time.time())),
+                                "type": "text",
+                                "text": {"body": "Valid message"}
+                            },
+                            {
+                                "id": "audit_invalid",
+                                "from": "+9999999999",  # Unauthorized
+                                "timestamp": str(int(time.time()) + 1),
+                                "type": "text",
+                                "text": {"body": "Invalid message"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        self.config["whatsapp"]["allow_unsigned_webhooks"] = True
+
+        process_whatsapp_webhook(self.config, payload_bytes)
+
+        records = load_whatsapp_audit(self.config)
+        self.assertEqual(len(records), 2)
+
+        # Check statuses
+        records_by_id = {r["message_id"]: r for r in records}
+        self.assertEqual(records_by_id["audit_valid"]["status"], "admitted")
+        self.assertEqual(records_by_id["audit_invalid"]["status"], "rejected")
 
 
 if __name__ == "__main__":

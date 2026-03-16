@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `feature/sprint-7-whatsapp-connector` (Sprint 7)  
+> **Branch:** `feature/sprint-8-whatsapp-batch-support` (Sprint 8)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 7 — Real WhatsApp Connector Boundary  
+> **Status:** Sprint 8 — WhatsApp Batch Support and Daily-Use Readiness  
 
 ---
 
@@ -624,20 +624,61 @@ Standalone module that receives, validates, normalizes, and admits external requ
 Der WhatsApp Connector stellt die erste reale Messaging-Grenze dar. Er terminiert an der Intake-Schicht und stellt sicher, dass WhatsApp-Nachrichten niemals direkt ausführen, Repositories berühren oder Promotion auslösen.
 
 ```
-WhatsApp Webhook
+WhatsApp Webhook (Batch Payload)
     ↓
-Provider Verification (HMAC/API Key)
+Provider Verification (HMAC/API Key) — Entire Payload
     ↓
-Sender Identity Mapping
-    ↓
-Message Normalization
-    ↓
-Intake Pipeline (validate, dedupe, rate-limit)
-    ↓
-Ticket Creation in Inbox Only
+Per-Message Processing:
+  ├── Message Extraction & Iteration
+  ├── Sender Identity Mapping
+  ├── Message Normalization
+  ├── Intake Pipeline (validate, dedupe, rate-limit)
+  └── Ticket Creation in Inbox Only
     ↓
 Human Review Required
 ```
+
+### Batch-/Message-Array Handling
+
+- **Provider-Level Verification**: HMAC-Signatur gilt für gesamten Payload
+- **Per-Message Evaluation**: Jede Nachricht im Array wird individuell verarbeitet
+- **Independent Decisions**: Admit/Reject/Duplicate/Rate-Limit pro Nachricht
+- **No Silent Drops**: Alle validen Nachrichten werden verarbeitet
+- **Fail-Closed**: Provider-Verifikation-Fehler verwirft gesamten Payload
+
+### Per-Message Decision Model
+
+Jede Nachricht erhält eine explizite Entscheidung:
+
+| Status | Bedeutung | Folge |
+|--------|-----------|-------|
+| `admitted` | Valide Nachricht → Ticket erstellt | Inbox-Artefakt + Audit |
+| `rejected` | Ungültig (Sender/Auth/Signatur) | Audit-Record, kein Ticket |
+| `duplicate` | Replay erkannt | Audit-Record, kein Ticket |
+| `rate_limited` | Rate-Limit überschritten | Audit-Record, kein Ticket |
+
+### Daily-Use Readiness (Sprint 8)
+
+**Status**: Controlled Daily-Use Ready (Text-Only)
+
+**Approved Operating Mode**:
+- Text-only Nachrichten
+- Einzelner autorisierter Sender
+- Rate-Limiting aktiv
+- Deduplication aktiv
+- Manuelle Inbox-Review erforderlich
+- Secondary Intake Channel (nicht primär)
+
+**Operator Monitoring**:
+- Regelmäßige `whatsapp-status` Checks
+- Audit-Trail Review vor Promotion
+- Keine kritischen Tickets ausschließlich über WhatsApp
+
+**Bekannte Grenzen**:
+- Keine Media/Attachment-Unterstützung
+- Keine Multi-Sender-Unterstützung
+- Keine Gruppenchat-Unterstützung
+- Batch-Größe limitiert auf vernünftige Werte
 
 ### Sicherheit
 
@@ -666,19 +707,20 @@ Human Review Required
 
 ### Betrieb
 
-- **CLI Commands**: `whatsapp-config`, `whatsapp-validate`, `whatsapp-simulate`, `whatsapp-status`, `whatsapp-audit-show`
-- **Audit Trail**: Vollständige Nachverfolgung aller Events
+- **CLI Commands**: `whatsapp-config`, `whatsapp-validate`, `whatsapp-simulate`, `whatsapp-simulate-batch`, `whatsapp-status`, `whatsapp-audit-show`, `whatsapp-allowlist-show`
+- **Audit Trail**: Vollständige Nachverfolgung aller Events pro Nachricht
 - **Idempotency**: Message-ID-basierte Replay-Schutz
 - **Rate Limiting**: Pro-Sender und global
 - **Safe-by-Default**: Deaktiviert bis konfiguriert
 
-### Einschränkungen (v1)
+### Einschränkungen (nach Sprint 8)
 
 - Text-only Nachrichten (keine Medien)
 - Einzelner autorisierter Sender
 - Manuelle Review für alle Tickets erforderlich
 - Keine automatische Worker-Dispatch
 - Keine Gruppenchat-Unterstützung
+- Batch-Größe: Max 10 Nachrichten pro Payload (sicherheitsbegrenzt)
 
 ---
 
