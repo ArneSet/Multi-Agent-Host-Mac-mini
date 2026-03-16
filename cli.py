@@ -27,6 +27,12 @@ Usage:
     python3 cli.py intake-normalize SOURCE --title TITLE --worker WORKER [--description TEXT] [--branch BRANCH] [--priority PRIORITY]
     python3 cli.py intake-audit-show
     python3 cli.py intake-status
+    python3 cli.py whatsapp-config
+    python3 cli.py whatsapp-validate
+    python3 cli.py whatsapp-simulate --sender SENDER --message MESSAGE
+    python3 cli.py whatsapp-status
+    python3 cli.py whatsapp-audit-show
+    python3 cli.py whatsapp-allowlist-show
 """
 
 import argparse
@@ -72,6 +78,22 @@ from intake import (
     SOURCE_TRUST_LEVELS,
     INTAKE_STATUSES,
     ALLOWED_WORKERS as INTAKE_ALLOWED_WORKERS,
+)
+
+from whatsapp import (
+    load_whatsapp_config,
+    is_whatsapp_enabled,
+    get_whatsapp_access_token,
+    get_whatsapp_verify_token,
+    get_authorized_senders,
+    get_whatsapp_rate_limit,
+    get_whatsapp_dedup_window,
+    verify_webhook_request,
+    authorize_sender,
+    process_whatsapp_webhook,
+    load_whatsapp_audit,
+    WHATSAPP_MESSAGE_TYPES,
+    WHATSAPP_STATUSES,
 )
 
 _HERE = Path(__file__).resolve().parent
@@ -634,6 +656,170 @@ def cmd_intake_status(cfg, args):
             print(f"    {s}: {c}")
     return 0
 
+# ---------------------------------------------------------------------------
+# WhatsApp connector commands
+# ---------------------------------------------------------------------------
+
+def cmd_whatsapp_config(cfg, args):
+    """Show current WhatsApp connector configuration."""
+    whatsapp = load_whatsapp_config(cfg)
+    print("WhatsApp Connector Configuration:")
+    print(f"  Enabled:           {is_whatsapp_enabled(cfg)}")
+    print(f"  Webhook URL:       {whatsapp.get('webhook_url', 'not set')}")
+    print(f"  Verify token:      {'configured' if get_whatsapp_verify_token(cfg) else 'not set'}")
+    print(f"  Access token:      {'configured' if get_whatsapp_access_token(cfg) else 'not set'}")
+    print(f"  Authorized senders: {get_authorized_senders(cfg)}")
+    print(f"  Rate limit:        {get_whatsapp_rate_limit(cfg)}/min per sender")
+    print(f"  Dedup window:      {get_whatsapp_dedup_window(cfg)}s")
+    print(f"\n  Supported message types: {sorted(WHATSAPP_MESSAGE_TYPES)}")
+    print(f"  WhatsApp statuses: {sorted(WHATSAPP_STATUSES)}")
+    return 0
+
+
+def cmd_whatsapp_validate(cfg, args):
+    """Validate WhatsApp connector configuration and readiness."""
+    errors = []
+
+    if not is_whatsapp_enabled(cfg):
+        print("WhatsApp connector is disabled (set 'enabled: true' in config)")
+        return 1
+
+    if not get_whatsapp_access_token(cfg):
+        errors.append("Access token not configured")
+
+    if not get_whatsapp_verify_token(cfg):
+        errors.append("Verify token not configured")
+
+    authorized = get_authorized_senders(cfg)
+    if not authorized:
+        errors.append("No authorized senders configured")
+
+    webhook_url = load_whatsapp_config(cfg).get("webhook_url", "")
+    if not webhook_url:
+        errors.append("Webhook URL not configured")
+
+    if errors:
+        print("WhatsApp configuration validation FAILED:")
+        for e in errors:
+            print(f"  \u2717 {e}")
+        return 1
+
+    print("WhatsApp configuration validation PASSED")
+    print(f"  Authorized senders: {authorized}")
+    print(f"  Webhook URL: {webhook_url}")
+    return 0
+
+
+def cmd_whatsapp_simulate(cfg, args):
+    """Simulate a WhatsApp message through the connector."""
+    sender = args.sender
+    message = args.message
+
+    print(f"Simulating WhatsApp message from {sender}")
+    print(f"Message: {message}")
+    print()
+
+    # Create mock webhook payload
+    mock_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "field": "messages",
+                "value": {
+                    "messages": [{
+                        "id": f"mock_{int(time.time())}",
+                        "from": sender,
+                        "timestamp": str(int(time.time())),
+                        "type": "text",
+                        "text": {"body": message}
+                    }]
+                }
+            }]
+        }]
+    }
+
+    payload_bytes = json.dumps(mock_payload).encode("utf-8")
+
+    # Process through connector
+    result = process_whatsapp_webhook(cfg, payload_bytes)
+
+    print(f"Processing result: {result['status']}")
+    if result.get("detail"):
+        print(f"Detail: {result['detail']}")
+    if result.get("intake_result"):
+        intake = result["intake_result"]
+        print(f"Intake status: {intake.get('status')}")
+        if intake.get("ticket_path"):
+            print(f"Ticket created: {intake['ticket_path']}")
+
+    return 0 if result["status"] == "admitted" else 1
+
+
+def cmd_whatsapp_status(cfg, args):
+    """Show WhatsApp connector status and statistics."""
+    records = load_whatsapp_audit(cfg)
+
+    status_counts = {}
+    sender_counts = {}
+    for r in records:
+        s = r.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+        sender = r.get("sender", "unknown")
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    print("WhatsApp Connector Status:")
+    print(f"  Enabled:         {is_whatsapp_enabled(cfg)}")
+    print(f"  Total records:   {len(records)}")
+    if status_counts:
+        print("  By status:")
+        for s, c in sorted(status_counts.items()):
+            print(f"    {s}: {c}")
+    if sender_counts:
+        print("  By sender:")
+        for s, c in sorted(sender_counts.items()):
+            print(f"    {s}: {c}")
+    return 0
+
+
+def cmd_whatsapp_audit_show(cfg, args):
+    """Show WhatsApp connector audit trail."""
+    records = load_whatsapp_audit(cfg)
+    if not records:
+        print("No WhatsApp audit records found.")
+        return 0
+
+    print(f"WhatsApp Audit Trail: {len(records)} record(s)")
+    print()
+    for i, r in enumerate(records, 1):
+        print(f"  [{i}] {r.get('timestamp', '?')} \u2014 {r.get('status', '?')}")
+        if r.get("message_id"):
+            print(f"      Message ID: {r['message_id']}")
+        if r.get("sender"):
+            print(f"      Sender:     {r['sender']}")
+        if r.get("detail"):
+            print(f"      Detail:     {r['detail']}")
+        if r.get("intake_result"):
+            intake_status = r["intake_result"].get("status")
+            print(f"      Intake:     {intake_status}")
+        print()
+    return 0
+
+
+def cmd_whatsapp_allowlist_show(cfg, args):
+    """Show authorized WhatsApp senders and their authorization status."""
+    authorized = get_authorized_senders(cfg)
+    if not authorized:
+        print("No authorized senders configured.")
+        return 1
+
+    print("Authorized WhatsApp Senders:")
+    for sender in authorized:
+        auth_result, reason = authorize_sender(cfg, sender)
+        status = "✓ Authorized" if auth_result else f"✗ {reason}"
+        print(f"  {sender}: {status}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="HYBRIS Host Orchestrator CLI",
@@ -769,6 +955,26 @@ def main():
     # intake-status
     sub.add_parser("intake-status", help="Show intake system status")
 
+    # whatsapp-config
+    sub.add_parser("whatsapp-config", help="Show WhatsApp connector configuration")
+
+    # whatsapp-validate
+    sub.add_parser("whatsapp-validate", help="Validate WhatsApp connector configuration")
+
+    # whatsapp-simulate
+    p_wsim = sub.add_parser("whatsapp-simulate", help="Simulate WhatsApp message")
+    p_wsim.add_argument("--sender", required=True, help="Sender phone number")
+    p_wsim.add_argument("--message", required=True, help="Message text")
+
+    # whatsapp-status
+    sub.add_parser("whatsapp-status", help="Show WhatsApp connector status")
+
+    # whatsapp-audit-show
+    sub.add_parser("whatsapp-audit-show", help="Show WhatsApp audit trail")
+
+    # whatsapp-allowlist-show
+    sub.add_parser("whatsapp-allowlist-show", help="Show authorized WhatsApp senders")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -797,6 +1003,12 @@ def main():
         "intake-normalize": cmd_intake_normalize,
         "intake-audit-show": cmd_intake_audit_show,
         "intake-status": cmd_intake_status,
+        "whatsapp-config": cmd_whatsapp_config,
+        "whatsapp-validate": cmd_whatsapp_validate,
+        "whatsapp-simulate": cmd_whatsapp_simulate,
+        "whatsapp-status": cmd_whatsapp_status,
+        "whatsapp-audit-show": cmd_whatsapp_audit_show,
+        "whatsapp-allowlist-show": cmd_whatsapp_allowlist_show,
     }
 
     return commands[args.command](cfg, args)

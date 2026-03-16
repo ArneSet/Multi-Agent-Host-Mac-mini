@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `main` (Sprint 6)  
+> **Branch:** `feature/sprint-7-whatsapp-connector` (Sprint 7)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 6 — External Intake Adapter Layer  
+> **Status:** Sprint 7 — Real WhatsApp Connector Boundary  
 
 ---
 
@@ -24,9 +24,10 @@
 12. [Runtime State](#12-runtime-state)
 13. [Sicherheits- und Freigaberegeln](#13-sicherheits--und-freigaberegeln)
 14. [External Intake Adapter](#14-external-intake-adapter)
-15. [Bekannte Einschränkungen](#15-bekannte-einschränkungen)
-16. [Git-Changelog](#16-git-changelog)
-17. [Aktualisierungsprotokoll](#17-aktualisierungsprotokoll)
+15. [WhatsApp Connector Boundary](#15-whatsapp-connector-boundary)
+16. [Bekannte Einschränkungen](#16-bekannte-einschränkungen)
+17. [Git-Changelog](#17-git-changelog)
+18. [Aktualisierungsprotokoll](#18-aktualisierungsprotokoll)
 
 ---
 
@@ -616,7 +617,72 @@ Standalone module that receives, validates, normalizes, and admits external requ
 
 ---
 
-## 15. Bekannte Einschränkungen
+## 15. WhatsApp Connector Boundary
+
+### Architektur
+
+Der WhatsApp Connector stellt die erste reale Messaging-Grenze dar. Er terminiert an der Intake-Schicht und stellt sicher, dass WhatsApp-Nachrichten niemals direkt ausführen, Repositories berühren oder Promotion auslösen.
+
+```
+WhatsApp Webhook
+    ↓
+Provider Verification (HMAC/API Key)
+    ↓
+Sender Identity Mapping
+    ↓
+Message Normalization
+    ↓
+Intake Pipeline (validate, dedupe, rate-limit)
+    ↓
+Ticket Creation in Inbox Only
+    ↓
+Human Review Required
+```
+
+### Sicherheit
+
+- **Provider Auth**: HMAC-Signatur oder API-Key-Verifikation
+- **Sender Auth**: Whitelist autorisierter WhatsApp-Nummern
+- **Boundary Enforcement**: Nur Ticket-Erstellung in Inbox
+- **No Direct Execution**: Keine Worker-Ausführung aus WhatsApp
+- **No Repo Access**: Kein Zugriff auf test_repo oder prod_repo
+- **No Promotion**: Keine Promotion-Auslösung
+
+### Konfiguration
+
+```json
+{
+  "whatsapp": {
+    "enabled": false,
+    "webhook_url": "https://domain.com/whatsapp/webhook",
+    "verify_token": "verify_token",
+    "access_token": "EAA...",
+    "authorized_senders": ["+1234567890"],
+    "rate_limit_per_sender": 5,
+    "dedup_window_seconds": 300
+  }
+}
+```
+
+### Betrieb
+
+- **CLI Commands**: `whatsapp-config`, `whatsapp-validate`, `whatsapp-simulate`, `whatsapp-status`, `whatsapp-audit-show`
+- **Audit Trail**: Vollständige Nachverfolgung aller Events
+- **Idempotency**: Message-ID-basierte Replay-Schutz
+- **Rate Limiting**: Pro-Sender und global
+- **Safe-by-Default**: Deaktiviert bis konfiguriert
+
+### Einschränkungen (v1)
+
+- Text-only Nachrichten (keine Medien)
+- Einzelner autorisierter Sender
+- Manuelle Review für alle Tickets erforderlich
+- Keine automatische Worker-Dispatch
+- Keine Gruppenchat-Unterstützung
+
+---
+
+## 16. Bekannte Einschränkungen
 
 | # | Einschränkung | Risiko | Geplant für |
 |---|--------------|--------|-------------|
@@ -639,8 +705,9 @@ Standalone module that receives, validates, normalizes, and admits external requ
 | 17 | Kein Operator-Identity in Audit Records | Niedrig | Multi-User Sprint |
 | 18 | Audit Trail nicht kryptographisch signiert | Niedrig | — |
 | 19 | ~~Kein External Intake Adapter~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 6: intake.py mit Pipeline, CLI, Audit |
-| 20 | Future Intake Connectors nur als Placeholder | Erwartungsgemäß | Connector Sprint |
+| 20 | ~~Future Intake Connectors nur als Placeholder~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 7: WhatsApp Connector Boundary implementiert |
 | 21 | Intake hat kein Authentication Token System | Niedrig | Connector Sprint |
+| 22 | WhatsApp Connector nur Text-Nachrichten | Erwartungsgemäß | Future Sprint: Media Support |
 
 ---
 
@@ -657,6 +724,7 @@ Standalone module that receives, validates, normalizes, and admits external requ
 | 2026-03-16 | — | Sprint 4: Physical Repo Separation & Promotion Safety (this branch) |
 | 2026-03-16 | — | Sprint 5: QA Gate, Manual Promotion Execution, Audit Trail (this branch) |
 | 2026-03-16 | — | Sprint 6: External Intake Adapter Layer (this branch) |
+| 2026-03-16 | — | Sprint 7: Real WhatsApp Connector Boundary (this branch) |
 
 ---
 
@@ -669,3 +737,4 @@ Standalone module that receives, validates, normalizes, and admits external requ
 | 2026-03-16 | Sprint 4 Agent | Physical Repo Separation, Promotion Safety, Readiness Check, 3 neue Docs, 10 neue Tests (66 total) |
 | 2026-03-16 | Sprint 5 Agent | QA Gate, Manual Promotion Execution, Promotion Status Tracking, Audit Trail, 4 neue Docs, 20 neue Tests (86 total) |
 | 2026-03-16 | Sprint 6 Agent | External Intake Adapter: intake.py, 7 CLI Commands, intake auth/trust, normalization, dedup, rate limiting, audit, 4 neue Docs, 65 neue Tests (151 total) |
+| 2026-03-16 | Sprint 7 Agent | WhatsApp Connector Boundary: whatsapp.py, 5 CLI Commands, provider auth, sender identity, idempotency, audit, 5 neue Docs, config updates, 50 neue Tests (201 total) |
