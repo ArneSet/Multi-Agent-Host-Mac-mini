@@ -1,5 +1,5 @@
 {
-    "version": "1.2.0",
+    "version": "1.3.0",
     "project_name": "HYBRIS",
     "repo_targets": {
         "test_repo": "~/Workspace/HYBRIS/repos/hybris-test",
@@ -33,5 +33,14 @@
         "require_branch_for_active": true,
         "auto_commit": false,
         "auto_merge": false
+    },
+    "intake": {
+        "trusted_sources": ["local_simulated"],
+        "blocked_sources": [],
+        "rate_limit": {
+            "max_per_source_per_minute": 5,
+            "max_global_per_minute": 20
+        },
+        "duplicate_window_seconds": 300
     }
 }
