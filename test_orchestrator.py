@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import orchestrator as orc
 
@@ -544,6 +545,7 @@ class TestReviewApprovalPromotion(unittest.TestCase):
         tid = self._put_ticket_in_review()
         orc.create_review_package(self.cfg, tid)
         orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
         request = orc.create_promotion_request(self.cfg, tid)
         self.assertEqual(request["ticket_id"], tid)
         self.assertEqual(request["source_repo"], "test_repo")
@@ -557,6 +559,7 @@ class TestReviewApprovalPromotion(unittest.TestCase):
         tid = self._put_ticket_in_review()
         orc.create_review_package(self.cfg, tid)
         orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
         request = orc.create_promotion_request(self.cfg, tid, dry_run=True)
         self.assertEqual(request["status"], "dry_run")
         # No file written in dry-run
@@ -631,6 +634,7 @@ class TestPromotionReadiness(unittest.TestCase):
         tid = self._put_ticket_in_review()
         orc.create_review_package(self.cfg, tid)
         orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
         result = orc.check_promotion_readiness(self.cfg, tid)
         self.assertTrue(result["ready"])
         self.assertTrue(all(c["passed"] for c in result["checks"]))
@@ -673,10 +677,256 @@ class TestPromotionReadiness(unittest.TestCase):
         tid = self._put_ticket_in_review()
         orc.create_review_package(self.cfg, tid)
         orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
         self.cfg["repo_targets"]["prod_repo"] = self.tmp
         with self.assertRaises(ValueError) as ctx:
             orc.create_promotion_request(self.cfg, tid)
         self.assertIn("REPO SEPARATION VIOLATION", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# QA Gate (Sprint 5)
+# ---------------------------------------------------------------------------
+
+class TestQAGate(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put_ticket_in_review(self, ticket_id="t-qa1"):
+        _create_ticket(self.cfg, "review", ticket_id, branch="feature/test")
+        return ticket_id
+
+    def test_create_qa_passed(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        result = orc.create_qa_result(self.cfg, tid, True, "All good")
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["notes"], "All good")
+        qa_file = Path(self.cfg["management_root"]) / "reviews" / f"{tid}.qa.json"
+        self.assertTrue(qa_file.exists())
+
+    def test_create_qa_failed(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        result = orc.create_qa_result(self.cfg, tid, False, "Bugs found")
+        self.assertFalse(result["passed"])
+
+    def test_qa_requires_review_package(self):
+        _create_ticket(self.cfg, "review", "t-qa-norev")
+        with self.assertRaises(FileNotFoundError):
+            orc.create_qa_result(self.cfg, "t-qa-norev", True)
+
+    def test_qa_is_immutable(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_qa_result(self.cfg, tid, True)
+        with self.assertRaises(RuntimeError) as ctx:
+            orc.create_qa_result(self.cfg, tid, False)
+        self.assertIn("immutable", str(ctx.exception))
+
+    def test_promotion_blocked_without_qa(self):
+        """Promotion request requires QA passed."""
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        with self.assertRaises(FileNotFoundError):
+            orc.create_promotion_request(self.cfg, tid)
+
+    def test_promotion_blocked_qa_failed(self):
+        """Promotion request blocked if QA failed."""
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, False, "Bugs found")
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, tid)
+        self.assertIn("QA has not passed", str(ctx.exception))
+
+    def test_readiness_includes_qa_check(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        names = [c["name"] for c in result["checks"]]
+        self.assertIn("qa_gate", names)
+
+
+# ---------------------------------------------------------------------------
+# Promotion execution (Sprint 5)
+# ---------------------------------------------------------------------------
+
+class TestPromotionExecution(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup_promotable_ticket(self, ticket_id="t-exec1"):
+        _create_ticket(self.cfg, "review", ticket_id, branch="feature/test")
+        orc.create_review_package(self.cfg, ticket_id)
+        orc.create_approval_decision(self.cfg, ticket_id, "approved")
+        orc.create_qa_result(self.cfg, ticket_id, True)
+        orc.create_promotion_request(self.cfg, ticket_id)
+        return ticket_id
+
+    def test_execute_requires_promotion_request(self):
+        with self.assertRaises(FileNotFoundError):
+            orc.execute_promotion(self.cfg, "nonexistent")
+
+    def test_execute_already_executed_blocked(self):
+        tid = self._setup_promotable_ticket()
+        orc.update_promotion_status(self.cfg, tid, "executed")
+        with self.assertRaises(RuntimeError) as ctx:
+            orc.execute_promotion(self.cfg, tid)
+        self.assertIn("already executed", str(ctx.exception))
+
+    @patch("orchestrator.subprocess.run")
+    def test_preview_records_audit(self, mock_run):
+        tid = self._setup_promotable_ticket()
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n", stderr="")
+        audit = orc.execute_promotion(self.cfg, tid, dry_run=True)
+        self.assertEqual(audit["result"], "preview_ok")
+        self.assertTrue(audit["dry_run"])
+        self.assertEqual(mock_run.call_count, 1)
+
+    @patch("orchestrator.subprocess.run")
+    def test_execute_calls_git_fetch(self, mock_run):
+        tid = self._setup_promotable_ticket()
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n", stderr="")
+        audit = orc.execute_promotion(self.cfg, tid, dry_run=False)
+        self.assertEqual(audit["result"], "executed")
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("orchestrator.subprocess.run")
+    def test_execute_records_audit(self, mock_run):
+        tid = self._setup_promotable_ticket()
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc1234\n", stderr="")
+        orc.execute_promotion(self.cfg, tid, dry_run=False)
+        trail = orc.load_audit_trail(self.cfg, tid)
+        self.assertEqual(len(trail), 1)
+        self.assertEqual(trail[0]["result"], "executed")
+        self.assertEqual(trail[0]["ticket_id"], tid)
+
+
+# ---------------------------------------------------------------------------
+# Promotion status tracking (Sprint 5)
+# ---------------------------------------------------------------------------
+
+class TestPromotionStatusTracking(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup_promotable_ticket(self, ticket_id="t-stat1"):
+        _create_ticket(self.cfg, "review", ticket_id, branch="feature/test")
+        orc.create_review_package(self.cfg, ticket_id)
+        orc.create_approval_decision(self.cfg, ticket_id, "approved")
+        orc.create_qa_result(self.cfg, ticket_id, True)
+        orc.create_promotion_request(self.cfg, ticket_id)
+        return ticket_id
+
+    def test_initial_status_pending(self):
+        tid = self._setup_promotable_ticket()
+        request = orc.load_promotion_request(self.cfg, tid)
+        self.assertEqual(request["status"], "pending")
+
+    def test_status_update_to_previewed(self):
+        tid = self._setup_promotable_ticket()
+        orc.update_promotion_status(self.cfg, tid, "previewed")
+        request = orc.load_promotion_request(self.cfg, tid)
+        self.assertEqual(request["status"], "previewed")
+
+    def test_status_history_recorded(self):
+        tid = self._setup_promotable_ticket()
+        orc.update_promotion_status(self.cfg, tid, "previewed")
+        orc.update_promotion_status(self.cfg, tid, "executed")
+        request = orc.load_promotion_request(self.cfg, tid)
+        self.assertEqual(len(request["status_history"]), 2)
+        self.assertEqual(request["status_history"][0]["status"], "previewed")
+        self.assertEqual(request["status_history"][1]["status"], "executed")
+
+    def test_invalid_status_rejected(self):
+        tid = self._setup_promotable_ticket()
+        with self.assertRaises(ValueError):
+            orc.update_promotion_status(self.cfg, tid, "magic_state")
+
+
+# ---------------------------------------------------------------------------
+# Audit trail (Sprint 5)
+# ---------------------------------------------------------------------------
+
+class TestAuditTrail(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_audit_trail(self):
+        records = orc.load_audit_trail(self.cfg, "nonexistent")
+        self.assertEqual(records, [])
+
+    def test_append_and_load(self):
+        record = {"ticket_id": "t-aud1", "action": "test", "timestamp": "2026-03-16"}
+        orc._append_audit_record(self.cfg, "t-aud1", record)
+        trail = orc.load_audit_trail(self.cfg, "t-aud1")
+        self.assertEqual(len(trail), 1)
+        self.assertEqual(trail[0]["action"], "test")
+
+    def test_multiple_records(self):
+        for i in range(3):
+            record = {"ticket_id": "t-aud2", "action": f"action_{i}"}
+            orc._append_audit_record(self.cfg, "t-aud2", record)
+        trail = orc.load_audit_trail(self.cfg, "t-aud2")
+        self.assertEqual(len(trail), 3)
+
+    def test_audit_captures_key_fields(self):
+        record = {
+            "ticket_id": "t-aud3",
+            "promotion_request": "promotions/t-aud3.promotion.json",
+            "source_repo": "/test",
+            "target_repo": "/prod",
+            "review_package": "reviews/t-aud3.review.json",
+            "approval_decision": "reviews/t-aud3.approval.json",
+            "qa_result": "reviews/t-aud3.qa.json",
+            "branch": "feature/test",
+            "action": "execute",
+            "dry_run": False,
+            "timestamp": "2026-03-16T12:00:00Z",
+            "result": "executed",
+        }
+        orc._append_audit_record(self.cfg, "t-aud3", record)
+        trail = orc.load_audit_trail(self.cfg, "t-aud3")
+        r = trail[0]
+        for key in ["ticket_id", "source_repo", "target_repo", "review_package",
+                     "approval_decision", "qa_result", "branch", "action",
+                     "dry_run", "timestamp", "result"]:
+            self.assertIn(key, r, f"Missing key: {key}")
 
 
 # ---------------------------------------------------------------------------
