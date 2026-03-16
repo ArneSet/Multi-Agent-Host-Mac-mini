@@ -1,0 +1,14 @@
+# Runtime / local
+config.json
+*.pyc
+__pycache__/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
