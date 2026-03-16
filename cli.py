@@ -20,6 +20,13 @@ Usage:
     python3 cli.py promotion-check TICKET_ID
     python3 cli.py promotion-status TICKET_ID
     python3 cli.py audit-show TICKET_ID
+    python3 cli.py intake-config
+    python3 cli.py intake-validate SOURCE --title TITLE --worker WORKER [--description TEXT] [--branch BRANCH] [--priority PRIORITY]
+    python3 cli.py intake-simulate SOURCE --title TITLE --worker WORKER [--description TEXT] [--branch BRANCH] [--priority PRIORITY]
+    python3 cli.py intake-submit SOURCE --title TITLE --worker WORKER [--description TEXT] [--branch BRANCH] [--priority PRIORITY]
+    python3 cli.py intake-normalize SOURCE --title TITLE --worker WORKER [--description TEXT] [--branch BRANCH] [--priority PRIORITY]
+    python3 cli.py intake-audit-show
+    python3 cli.py intake-status
 """
 
 import argparse
@@ -50,6 +57,21 @@ from orchestrator import (
     update_promotion_status,
     execute_promotion,
     load_audit_trail,
+)
+
+from intake import (
+    get_source_trust,
+    get_rate_limit,
+    load_intake_config,
+    validate_source,
+    validate_payload,
+    normalize_request,
+    process_intake,
+    load_intake_audit,
+    INTAKE_SOURCES,
+    SOURCE_TRUST_LEVELS,
+    INTAKE_STATUSES,
+    ALLOWED_WORKERS as INTAKE_ALLOWED_WORKERS,
 )
 
 _HERE = Path(__file__).resolve().parent
@@ -457,6 +479,161 @@ def cmd_audit_show(cfg, args):
         print()
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Intake commands (Sprint 6)
+# ---------------------------------------------------------------------------
+
+def _build_intake_payload(args):
+    """Build intake payload dict from CLI args."""
+    payload = {"title": args.title, "worker": args.worker}
+    if args.description:
+        payload["description"] = args.description
+    if args.branch:
+        payload["branch"] = args.branch
+    if args.priority:
+        payload["priority"] = args.priority
+    return payload
+
+
+def cmd_intake_config(cfg, args):
+    """Show current intake configuration."""
+    intake = load_intake_config(cfg)
+    print("Intake Configuration:")
+    print(f"  Trusted sources:  {intake.get('trusted_sources', [])}")
+    print(f"  Blocked sources:  {intake.get('blocked_sources', [])}")
+    rl = intake.get("rate_limit", {})
+    print(f"  Rate limit:       {rl.get('max_per_source_per_minute', 5)}/min per source, "
+          f"{rl.get('max_global_per_minute', 20)}/min global")
+    print(f"  Dedup window:     {intake.get('duplicate_window_seconds', 300)}s")
+    print(f"\n  Known sources: {sorted(INTAKE_SOURCES)}")
+    print(f"  Trust levels:  {sorted(SOURCE_TRUST_LEVELS)}")
+    print(f"  Intake states: {sorted(INTAKE_STATUSES)}")
+    return 0
+
+
+def cmd_intake_validate(cfg, args):
+    """Validate an intake request without admitting it."""
+    source = args.source
+    payload = _build_intake_payload(args)
+
+    print(f"Validating intake from source: {source}")
+    print()
+
+    source_errors = validate_source(source)
+    if source_errors:
+        print("  Source validation: FAILED")
+        for e in source_errors:
+            print(f"    \u2717 {e}")
+    else:
+        trust = get_source_trust(cfg, source)
+        print(f"  Source validation: OK (trust={trust})")
+
+    payload_errors = validate_payload(payload)
+    if payload_errors:
+        print("  Payload validation: FAILED")
+        for e in payload_errors:
+            print(f"    \u2717 {e}")
+    else:
+        print("  Payload validation: OK")
+
+    if source_errors or payload_errors:
+        return 1
+    print("\n  Result: intake request is valid")
+    return 0
+
+
+def cmd_intake_simulate(cfg, args):
+    """Simulate full intake pipeline without admitting (dry-run)."""
+    source = args.source
+    payload = _build_intake_payload(args)
+
+    print(f"Simulating intake from source: {source}")
+    result = process_intake(cfg, source, payload, admit=False)
+    print(f"  Intake ID: {result['intake_id']}")
+    print(f"  Status:    {result['status']}")
+    print(f"  Detail:    {result['detail']}")
+    if result.get("normalized"):
+        print("  Normalized:")
+        for k, v in result["normalized"].items():
+            print(f"    {k}: {v}")
+    return 0 if result["status"] == "normalized" else 1
+
+
+def cmd_intake_submit(cfg, args):
+    """Submit an intake request — full pipeline with admission."""
+    source = args.source
+    payload = _build_intake_payload(args)
+
+    print(f"Submitting intake from source: {source}")
+    result = process_intake(cfg, source, payload, admit=True)
+    print(f"  Intake ID:   {result['intake_id']}")
+    print(f"  Status:      {result['status']}")
+    print(f"  Detail:      {result['detail']}")
+    if result.get("ticket_path"):
+        print(f"  Ticket file: {result['ticket_path']}")
+    return 0 if result["status"] == "admitted" else 1
+
+
+def cmd_intake_normalize(cfg, args):
+    """Show normalization result for an intake payload."""
+    source = args.source
+    payload = _build_intake_payload(args)
+
+    print(f"Normalizing intake from source: {source}")
+    normalized = normalize_request(source, payload)
+    print("  Normalized form:")
+    for k, v in normalized.items():
+        print(f"    {k}: {v}")
+    return 0
+
+
+def cmd_intake_audit_show(cfg, args):
+    """Show intake audit trail."""
+    records = load_intake_audit(cfg)
+    if not records:
+        print("No intake audit records found.")
+        return 0
+
+    print(f"Intake Audit Trail: {len(records)} record(s)")
+    print()
+    for i, r in enumerate(records, 1):
+        print(f"  [{i}] {r.get('timestamp', '?')} \u2014 {r.get('status', '?')}")
+        print(f"      Intake ID: {r.get('intake_id', '?')}")
+        print(f"      Source:    {r.get('source', '?')}")
+        if r.get("detail"):
+            print(f"      Detail:    {r['detail']}")
+        print()
+    return 0
+
+
+def cmd_intake_status(cfg, args):
+    """Show summary of intake system status."""
+    records = load_intake_audit(cfg)
+    intake = load_intake_config(cfg)
+
+    status_counts = {}
+    source_counts = {}
+    for r in records:
+        s = r.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+        src = r.get("source", "unknown")
+        source_counts[src] = source_counts.get(src, 0) + 1
+
+    print("Intake System Status:")
+    print(f"  Total records:    {len(records)}")
+    print(f"  Trusted sources:  {intake.get('trusted_sources', [])}")
+    print(f"  Blocked sources:  {intake.get('blocked_sources', [])}")
+    if status_counts:
+        print("  By status:")
+        for s, c in sorted(status_counts.items()):
+            print(f"    {s}: {c}")
+    if source_counts:
+        print("  By source:")
+        for s, c in sorted(source_counts.items()):
+            print(f"    {s}: {c}")
+    return 0
+
 def main():
     parser = argparse.ArgumentParser(
         description="HYBRIS Host Orchestrator CLI",
@@ -547,6 +724,51 @@ def main():
     p_audit = sub.add_parser("audit-show", help="Show audit trail for a ticket")
     p_audit.add_argument("ticket_id", help="Ticket ID")
 
+    # intake-config
+    sub.add_parser("intake-config", help="Show intake configuration")
+
+    # intake-validate
+    p_iv = sub.add_parser("intake-validate", help="Validate an intake request")
+    p_iv.add_argument("source", help="Intake source identifier")
+    p_iv.add_argument("--title", required=True, help="Ticket title")
+    p_iv.add_argument("--worker", required=True, help="Worker type")
+    p_iv.add_argument("--description", default="", help="Description")
+    p_iv.add_argument("--branch", default="", help="Branch name")
+    p_iv.add_argument("--priority", default="normal", help="Priority")
+
+    # intake-simulate
+    p_is = sub.add_parser("intake-simulate", help="Simulate intake (dry-run)")
+    p_is.add_argument("source", help="Intake source identifier")
+    p_is.add_argument("--title", required=True, help="Ticket title")
+    p_is.add_argument("--worker", required=True, help="Worker type")
+    p_is.add_argument("--description", default="", help="Description")
+    p_is.add_argument("--branch", default="", help="Branch name")
+    p_is.add_argument("--priority", default="normal", help="Priority")
+
+    # intake-submit
+    p_isub = sub.add_parser("intake-submit", help="Submit intake (creates ticket)")
+    p_isub.add_argument("source", help="Intake source identifier")
+    p_isub.add_argument("--title", required=True, help="Ticket title")
+    p_isub.add_argument("--worker", required=True, help="Worker type")
+    p_isub.add_argument("--description", default="", help="Description")
+    p_isub.add_argument("--branch", default="", help="Branch name")
+    p_isub.add_argument("--priority", default="normal", help="Priority")
+
+    # intake-normalize
+    p_in = sub.add_parser("intake-normalize", help="Show normalized form")
+    p_in.add_argument("source", help="Intake source identifier")
+    p_in.add_argument("--title", required=True, help="Ticket title")
+    p_in.add_argument("--worker", required=True, help="Worker type")
+    p_in.add_argument("--description", default="", help="Description")
+    p_in.add_argument("--branch", default="", help="Branch name")
+    p_in.add_argument("--priority", default="normal", help="Priority")
+
+    # intake-audit-show
+    sub.add_parser("intake-audit-show", help="Show intake audit trail")
+
+    # intake-status
+    sub.add_parser("intake-status", help="Show intake system status")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -568,6 +790,13 @@ def main():
         "qa-check": cmd_qa_check,
         "promotion-status": cmd_promotion_status,
         "audit-show": cmd_audit_show,
+        "intake-config": cmd_intake_config,
+        "intake-validate": cmd_intake_validate,
+        "intake-simulate": cmd_intake_simulate,
+        "intake-submit": cmd_intake_submit,
+        "intake-normalize": cmd_intake_normalize,
+        "intake-audit-show": cmd_intake_audit_show,
+        "intake-status": cmd_intake_status,
     }
 
     return commands[args.command](cfg, args)

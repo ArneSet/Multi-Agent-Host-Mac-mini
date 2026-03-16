@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `main` (Sprint 5)  
+> **Branch:** `main` (Sprint 6)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 5 — QA Gate, Manual Promotion Execution, Audit Trail  
+> **Status:** Sprint 6 — External Intake Adapter Layer  
 
 ---
 
@@ -23,9 +23,10 @@
 11. [Verzeichnis- und Pfadstruktur](#11-verzeichnis--und-pfadstruktur)
 12. [Runtime State](#12-runtime-state)
 13. [Sicherheits- und Freigaberegeln](#13-sicherheits--und-freigaberegeln)
-14. [Bekannte Einschränkungen](#14-bekannte-einschränkungen)
-15. [Git-Changelog](#15-git-changelog)
-16. [Aktualisierungsprotokoll](#16-aktualisierungsprotokoll)
+14. [External Intake Adapter](#14-external-intake-adapter)
+15. [Bekannte Einschränkungen](#15-bekannte-einschränkungen)
+16. [Git-Changelog](#16-git-changelog)
+17. [Aktualisierungsprotokoll](#17-aktualisierungsprotokoll)
 
 ---
 
@@ -552,7 +553,70 @@ hybris-host/
 
 ---
 
-## 14. Bekannte Einschränkungen
+## 14. External Intake Adapter
+
+> Sprint 6 — Safe message-to-ticket intake pipeline.
+
+### Intake Module (`intake.py`)
+
+Standalone module that receives, validates, normalizes, and admits external requests into the ticket system. Strictly separated from execution code.
+
+### Intake Constants
+
+| Constant | Values |
+|----------|--------|
+| `INTAKE_SOURCES` | `local_simulated`, `future_whatsapp`, `future_openclaw`, `future_sms`, `future_api` |
+| `SOURCE_TRUST_LEVELS` | `trusted`, `untrusted`, `blocked` |
+| `INTAKE_STATUSES` | `received`, `rejected`, `normalized`, `admitted`, `duplicate`, `rate_limited`, `failed` |
+
+### Pipeline Stages
+
+1. Validate source → 2. Check trust → 3. Validate payload → 4. Check duplicate → 5. Check rate limit → 6. Normalize → 7. Admit (inbox) → 8. Audit
+
+### Safety Boundary
+
+- `intake.py` does NOT import `dispatch_worker`, `execute_promotion`, or `process_ticket`
+- No git operations, no repo access
+- Admitted tickets land in inbox only — manual lifecycle continues
+
+### CLI Commands (Sprint 6)
+
+| Command | Beschreibung |
+|---------|-------------|
+| `intake-config` | Show intake configuration |
+| `intake-validate SOURCE --title --worker` | Validate intake request |
+| `intake-simulate SOURCE --title --worker` | Simulate pipeline (dry-run) |
+| `intake-submit SOURCE --title --worker` | Submit and admit to inbox |
+| `intake-normalize SOURCE --title --worker` | Show normalization result |
+| `intake-audit-show` | Show intake audit trail |
+| `intake-status` | Show intake system status |
+
+### Config Section (v1.3.0)
+
+```json
+"intake": {
+    "trusted_sources": ["local_simulated"],
+    "blocked_sources": [],
+    "rate_limit": { "max_per_source_per_minute": 5, "max_global_per_minute": 20 },
+    "duplicate_window_seconds": 300
+}
+```
+
+### Intake State Files
+
+| Pfad | Funktion |
+|------|----------|
+| `management/intake/state/seen_hashes.json` | Duplicate detection state |
+| `management/intake/state/rate_state.json` | Rate limit counters |
+| `management/intake/audit/intake.audit.jsonl` | Append-only audit trail |
+
+### Tests
+
+65 tests in `test_intake.py` covering: source validation, trust levels, payload validation, unsafe content, sanitization, normalization, duplicates, rate limiting, admission, rejection, audit, and safety guarantees.
+
+---
+
+## 15. Bekannte Einschränkungen
 
 | # | Einschränkung | Risiko | Geplant für |
 |---|--------------|--------|-------------|
@@ -574,10 +638,13 @@ hybris-host/
 | 16 | Promotion führt kein git merge/push aus | Erwartungsgemäß | CD manuell |
 | 17 | Kein Operator-Identity in Audit Records | Niedrig | Multi-User Sprint |
 | 18 | Audit Trail nicht kryptographisch signiert | Niedrig | — |
+| 19 | ~~Kein External Intake Adapter~~ | ~~Erwartungsgemäß~~ | ✅ Sprint 6: intake.py mit Pipeline, CLI, Audit |
+| 20 | Future Intake Connectors nur als Placeholder | Erwartungsgemäß | Connector Sprint |
+| 21 | Intake hat kein Authentication Token System | Niedrig | Connector Sprint |
 
 ---
 
-## 15. Git-Changelog
+## 16. Git-Changelog
 
 | Datum | Commit | Beschreibung |
 |-------|--------|--------------|
@@ -589,10 +656,11 @@ hybris-host/
 | 2026-03-16 | `v0.3.0` | Tag: Sprint 3 Release |
 | 2026-03-16 | — | Sprint 4: Physical Repo Separation & Promotion Safety (this branch) |
 | 2026-03-16 | — | Sprint 5: QA Gate, Manual Promotion Execution, Audit Trail (this branch) |
+| 2026-03-16 | — | Sprint 6: External Intake Adapter Layer (this branch) |
 
 ---
 
-## 16. Aktualisierungsprotokoll
+## 17. Aktualisierungsprotokoll
 
 | Datum | Autor | Änderung |
 |-------|-------|----------|
@@ -600,3 +668,4 @@ hybris-host/
 | 2026-03-16 | Sprint 3 Agent | Dual Repo Architecture, Promotion Flow, Repo Authority, CLI-Erweiterung, 22 neue Tests |
 | 2026-03-16 | Sprint 4 Agent | Physical Repo Separation, Promotion Safety, Readiness Check, 3 neue Docs, 10 neue Tests (66 total) |
 | 2026-03-16 | Sprint 5 Agent | QA Gate, Manual Promotion Execution, Promotion Status Tracking, Audit Trail, 4 neue Docs, 20 neue Tests (86 total) |
+| 2026-03-16 | Sprint 6 Agent | External Intake Adapter: intake.py, 7 CLI Commands, intake auth/trust, normalization, dedup, rate limiting, audit, 4 neue Docs, 65 neue Tests (151 total) |
