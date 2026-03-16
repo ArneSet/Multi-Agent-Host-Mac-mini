@@ -1,9 +1,9 @@
 {
-    "version": "1.1.0",
+    "version": "1.2.0",
     "project_name": "HYBRIS",
     "repo_targets": {
-        "test_repo": "~/your-test-repo",
-        "prod_repo": "~/your-prod-repo"
+        "test_repo": "~/Workspace/HYBRIS/repos/hybris-test",
+        "prod_repo": "~/Workspace/HYBRIS/repos/hybris-prod"
     },
     "game_repo_root": "~/Desktop/HYBRIS - Mortal Realm",
     "host_repo_root": "~/Workspace/HYBRIS/repos/hybris-host",
