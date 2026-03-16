@@ -1,0 +1,33 @@
+{
+    "version": "1.0.0",
+    "project_name": "HYBRIS",
+    "game_repo_root": "~/Desktop/HYBRIS - Mortal Realm",
+    "host_repo_root": "~/Workspace/HYBRIS/repos/hybris-host",
+    "management_root": "~/Workspace/HYBRIS/management",
+    "tickets_dir": "tickets",
+    "logs_dir": "logs",
+    "artifacts_dir": "artifacts",
+    "sessions_dir": "sessions",
+    "ticket_states": ["inbox", "ready", "active", "review", "done", "failed"],
+    "valid_transitions": {
+        "inbox": ["ready"],
+        "ready": ["active"],
+        "active": ["review", "failed"],
+        "review": ["done", "active"],
+        "failed": ["ready"]
+    },
+    "allowed_workers": [
+        "code-worker",
+        "unity-worker",
+        "blender-worker",
+        "tripo-worker"
+    ],
+    "safety": {
+        "max_active_tickets": 1,
+        "protected_branches": ["main", "master", "develop"],
+        "allow_shell_exec_from_tickets": false,
+        "require_branch_for_active": true,
+        "auto_commit": false,
+        "auto_merge": false
+    }
+}
