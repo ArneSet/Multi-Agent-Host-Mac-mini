@@ -1,10 +1,10 @@
 # HYBRIS Agent Host — System Reference (Source of Truth)
 
 > **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `main` (Sprint 2)  
+> **Branch:** `main` (Sprint 3)  
 > **Repo:** `ArneSet/Multi-Agent-Host-Mac-mini`  
 > **Host Role:** Lokaler Agent-Orchestrator für HYBRIS-Entwicklung  
-> **Status:** Sprint 2 — Domain Model + Hardened Orchestrator  
+> **Status:** Sprint 3 — Dual Repo Promotion Architecture  
 
 ---
 
@@ -18,12 +18,14 @@
 6. [Rollen & Autorität](#6-rollen--autorität)
 7. [Ticket Lifecycle](#7-ticket-lifecycle)
 8. [Worker-Katalog](#8-worker-katalog)
-9. [Verzeichnis- und Pfadstruktur](#9-verzeichnis--und-pfadstruktur)
-10. [Runtime State](#10-runtime-state)
-11. [Sicherheits- und Freigaberegeln](#11-sicherheits--und-freigaberegeln)
-12. [Bekannte Einschränkungen](#12-bekannte-einschränkungen)
-13. [Git-Changelog](#13-git-changelog)
-14. [Aktualisierungsprotokoll](#14-aktualisierungsprotokoll)
+9. [Dual Repo Architecture](#9-dual-repo-architecture)
+10. [Promotion Flow](#10-promotion-flow)
+11. [Verzeichnis- und Pfadstruktur](#11-verzeichnis--und-pfadstruktur)
+12. [Runtime State](#12-runtime-state)
+13. [Sicherheits- und Freigaberegeln](#13-sicherheits--und-freigaberegeln)
+14. [Bekannte Einschränkungen](#14-bekannte-einschränkungen)
+15. [Git-Changelog](#15-git-changelog)
+16. [Aktualisierungsprotokoll](#16-aktualisierungsprotokoll)
 
 ---
 
@@ -80,7 +82,9 @@ Creative Director
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    CLI LAYER (cli.py)                        │
-│  Commands: list, show, process, transition, validate        │
+│  Commands: list, show, process, transition, validate,       │
+│           repo-targets, review-show, approve, reject,       │
+│           reticket, promote                                 │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ▼
@@ -102,6 +106,13 @@ Creative Director
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │              Worker Dispatch                         │    │
 │  │  _WORKER_MODULE_MAP (hardcoded) ∩ config allowlist   │    │
+│  │  → resolve_agent_repo() enforces test_repo only      │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │         Review / Approval / Promotion                │    │
+│  │  create_review_package → create_approval_decision    │    │
+│  │  → create_promotion_request (approved only)          │    │
 │  └─────────────────────────────────────────────────────┘    │
 └─────────────────────┬───────────────────────────────────────┘
                       │
@@ -250,7 +261,83 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
 
 ---
 
-## 9. Verzeichnis- und Pfadstruktur
+## 9. Dual Repo Architecture
+
+> Vollständige Definition: [docs/dual-repo-architecture.md](docs/dual-repo-architecture.md)
+
+### Prinzip
+
+Agenten arbeiten **ausschließlich** im **Test Repo**. Das **Prod Repo** ist nur über eine genehmigte Promotion erreichbar. Kein Agent hat jemals direkten Schreibzugriff auf Prod.
+
+### Repo Targets in Config
+
+```json
+"repo_targets": {
+  "test_repo": "/path/to/test/game-repo",
+  "prod_repo": "/path/to/prod/game-repo"
+}
+```
+
+### Code-Enforcement
+
+| Funktion | Zweck |
+|----------|-------|
+| `resolve_agent_repo(cfg)` | Gibt immer `test_repo` zurück — einziger Repo-Pfad für Worker |
+| `resolve_prod_repo(cfg)` | Gibt `prod_repo` zurück — nur für Promotion |
+| `validate_repo_target(cfg, target, allow_prod)` | Blockiert `prod_repo` als Agent-Ziel |
+| `dispatch_worker()` | Setzt `_agent_repo` im Worker-Config auf `test_repo` |
+
+### Autoritätsmatrix
+
+| Aktor | test_repo | prod_repo |
+|-------|:---------:|:---------:|
+| Worker (Agent) | Lesen + Schreiben | ✗ Kein Zugriff |
+| Orchestrator | Verwalten | Nur Promotion-Pfad |
+| Creative Director | Voll | Voll |
+
+---
+
+## 10. Promotion Flow
+
+> Vollständige Definition: [docs/promotion-flow.md](docs/promotion-flow.md)
+
+### Ablauf
+
+```
+Ticket in review
+  └──▶ create_review_package()
+         └──▶ Creative Director prüft
+                ├──▶ approve → create_approval_decision("approved")
+                │       └──▶ create_promotion_request()
+                │               └──▶ test_repo → prod_repo (manuell/skript)
+                ├──▶ reject → create_approval_decision("rejected")
+                │       └──▶ Ticket → failed
+                └──▶ reticket → create_approval_decision("reticketed")
+                        └──▶ Ticket → failed (neues Ticket erforderlich)
+```
+
+### Regeln
+
+1. **ReviewPackage** muss existieren, bevor eine Entscheidung getroffen wird
+2. **ApprovalDecision** ist immutabel — einmal gesetzt, nicht änderbar
+3. **PromotionRequest** erfordert `decision == "approved"`
+4. Promotion ist **nie automatisch** — Creative Director muss genehmigen
+5. `--dry-run` bei Promotion schreibt keine Datei
+
+### CLI-Befehle
+
+| Befehl | Beschreibung |
+|--------|-------------|
+| `review-show TICKET_ID` | ReviewPackage anzeigen (erstellt es bei Bedarf) |
+| `approve TICKET_ID` | Ticket genehmigen |
+| `reject TICKET_ID` | Ticket ablehnen |
+| `reticket TICKET_ID` | Ticket zurückgeben (neuer Scope) |
+| `promote TICKET_ID` | Promotion-Request erstellen |
+| `repo-targets` | Konfigurierte Repo-Targets anzeigen |
+
+---
+
+## 11. Verzeichnis- und Pfadstruktur
 
 ### Host Repo (`hybris-host/`)
 
@@ -267,7 +354,10 @@ hybris-host/
 ├── docs/
 │   ├── domain-model.md                ← Domain Model
 │   ├── ticket-lifecycle.md            ← Lifecycle-Definition
-│   └── roles-and-authority.md         ← Rollen & Autoritätsmatrix
+│   ├── roles-and-authority.md         ← Rollen & Autoritätsmatrix
+│   ├── dual-repo-architecture.md      ← Dual Repo (Sprint 3)
+│   ├── promotion-flow.md              ← Promotion Flow (Sprint 3)
+│   └── repo-authority-boundaries.md   ← Repo Authority (Sprint 3)
 └── workers/
     ├── __init__.py
     ├── base_worker.py
@@ -292,6 +382,8 @@ hybris-host/
 │   ├── orchestrator/   ← Orchestrator-Logs pro Ticket
 │   └── worker/         ← Worker-Logs pro Ticket
 ├── artifacts/          ← Worker-Ausgaben
+├── reviews/            ← ReviewPackages + ApprovalDecisions
+├── promotions/         ← PromotionRequests
 ├── sessions/           ← (zukünftig)
 └── locks/              ← fcntl Lock-Files pro Ticket
 ```
@@ -300,13 +392,15 @@ hybris-host/
 
 | Config-Key | Beschreibung | Beispiel |
 |-----------|--------------|---------|
-| `game_repo_root` | Pfad zum HYBRIS Game Repo | `~/Workspace/HYBRIS/repos/hybris-game` |
+| `game_repo_root` | Pfad zum HYBRIS Game Repo (Legacy) | `~/Workspace/HYBRIS/repos/hybris-game` |
 | `host_repo_root` | Pfad zum Host Repo | `~/Workspace/HYBRIS/repos/hybris-host` |
 | `management_root` | Runtime-Daten (nicht versioniert) | `~/Workspace/HYBRIS/management` |
+| `repo_targets.test_repo` | Agent-Arbeitsrepo (nur Lesen+Schreiben) | `~/Desktop/HYBRIS - Mortal Realm` |
+| `repo_targets.prod_repo` | Produktionsrepo (nur Promotion) | `~/Desktop/HYBRIS - Mortal Realm` |
 
 ---
 
-## 10. Runtime State
+## 12. Runtime State
 
 ### Tickets
 
@@ -337,7 +431,21 @@ hybris-host/
 
 ---
 
-## 11. Sicherheits- und Freigaberegeln
+### Reviews
+
+- **ReviewPackage:** `reviews/<ticket_id>.review.json` — Prüfpaket mit Artefakten, Branch, Worker
+- **ApprovalDecision:** `reviews/<ticket_id>.approval.json` — Immutable Entscheidung (approved/rejected/reticketed)
+- **Erzeugt durch:** `create_review_package()`, `create_approval_decision()`
+
+### Promotions
+
+- **PromotionRequest:** `promotions/<ticket_id>.promotion.json` — Promotion von test_repo → prod_repo
+- **Erfordert:** Approved ApprovalDecision
+- **Status:** `pending` (erstellt), `dry_run` (Simulation)
+
+---
+
+## 13. Sicherheits- und Freigaberegeln
 
 ### Eingabe-Sanitization
 
@@ -348,6 +456,8 @@ hybris-host/
 | Branch Injection | `validate_branch()` — Regex + Protected-List | ✓ |
 | Log-Pfad Traversal | `write_log()` — Category-Regex + path_within | ✓ |
 | Worker Injection | Doppeltes Gate: hardcoded Map ∩ Config Allowlist | ✓ |
+| Repo Access | `validate_repo_target()` — Agents blocked from prod_repo | ✓ |
+| Promotion | Requires approved ApprovalDecision, immutable records | ✓ |
 
 ### Concurrency
 
@@ -378,7 +488,7 @@ hybris-host/
 
 ---
 
-## 12. Bekannte Einschränkungen
+## 14. Bekannte Einschränkungen
 
 | # | Einschränkung | Risiko | Geplant für |
 |---|--------------|--------|-------------|
@@ -391,22 +501,28 @@ hybris-host/
 | 7 | DirectorRequest nur als manuelles Ticket | Erwartungsgemäß | Sprint 5 |
 | 8 | `fcntl.flock` nur lokal (kein NFS/Multi-Host) | Niedrig (einzelner Host) | — |
 | 9 | Kein Retry-Counter / Max-Retries | Niedrig | Sprint 3 |
-| 10 | Desktop-Pfad im Game Repo noch nicht migriert | Betriebsrisiko | Vor Sprint 3 |
+| 10 | Desktop-Pfad im Game Repo noch nicht migriert | Betriebsrisiko | Sprint 4 |
+| 11 | test_repo und prod_repo zeigen aktuell auf gleichen Pfad | Betriebsrisiko | Sprint 4: Repo-Split |
+| 12 | Promotion führt noch keine Git-Operationen aus | Erwartungsgemäß | Sprint 4 |
+| 13 | Kein QA-Gate zwischen active und review | Erwartungsgemäß | Sprint 4 |
 
 ---
 
-## 13. Git-Changelog
+## 15. Git-Changelog
 
 | Datum | Commit | Beschreibung |
 |-------|--------|--------------|
 | 2026-03-16 | `d16d0bf` | Sprint 1: Hardened Host Orchestrator Baseline (squash merge) |
 | 2026-03-16 | `v0.1.0` | Tag: Sprint 1 Release |
-| 2026-03-16 | — | Sprint 2: Domain Model + System Reference (this branch) |
+| 2026-03-16 | `a3f2f5d` | Sprint 2: Domain Model + System Reference (squash merge) |
+| 2026-03-16 | `v0.2.0` | Tag: Sprint 2 Release |
+| 2026-03-16 | — | Sprint 3: Dual Repo Promotion Architecture (this branch) |
 
 ---
 
-## 14. Aktualisierungsprotokoll
+## 16. Aktualisierungsprotokoll
 
 | Datum | Autor | Änderung |
 |-------|-------|----------|
 | 2026-03-16 | Sprint 2 Agent | Erstversion: System Reference, Domain Model, Ticket Lifecycle, Roles & Authority |
+| 2026-03-16 | Sprint 3 Agent | Dual Repo Architecture, Promotion Flow, Repo Authority, CLI-Erweiterung, 22 neue Tests |
