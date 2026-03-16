@@ -42,6 +42,10 @@ def _make_cfg(tmp: str) -> dict:
             "failed": ["ready"],
         },
         "allowed_workers": ["code-worker", "unity-worker"],
+        "repo_targets": {
+            "test_repo": tmp,
+            "prod_repo": os.path.join(tmp, "prod_repo"),
+        },
         "safety": {
             "max_active_tickets": 1,
             "protected_branches": ["main", "master", "develop"],
@@ -374,6 +378,190 @@ class TestProcessTicket(unittest.TestCase):
         # dry-run: file stays in inbox
         state, _ = orc.find_ticket(self.cfg, "t-pipe1")
         self.assertEqual(state, "inbox")
+
+
+# ---------------------------------------------------------------------------
+# Repo targeting (Sprint 3)
+# ---------------------------------------------------------------------------
+
+class TestRepoTargeting(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_resolve_agent_repo_returns_test_repo(self):
+        result = orc.resolve_agent_repo(self.cfg)
+        self.assertEqual(result, self.tmp)
+
+    def test_resolve_agent_repo_missing_raises(self):
+        cfg = dict(self.cfg)
+        cfg["repo_targets"] = {}
+        with self.assertRaises(ValueError):
+            orc.resolve_agent_repo(cfg)
+
+    def test_resolve_prod_repo(self):
+        result = orc.resolve_prod_repo(self.cfg)
+        self.assertEqual(result, os.path.join(self.tmp, "prod_repo"))
+
+    def test_validate_repo_target_test_ok(self):
+        orc.validate_repo_target(self.cfg, "test_repo")  # should not raise
+
+    def test_validate_repo_target_prod_blocked(self):
+        with self.assertRaises(ValueError) as ctx:
+            orc.validate_repo_target(self.cfg, "prod_repo")
+        self.assertIn("cannot be used as an agent", str(ctx.exception))
+
+    def test_validate_repo_target_prod_allowed_explicit(self):
+        orc.validate_repo_target(self.cfg, "prod_repo", allow_prod=True)
+
+    def test_validate_repo_target_unknown_rejected(self):
+        with self.assertRaises(ValueError):
+            orc.validate_repo_target(self.cfg, "mystery_repo")
+
+    def test_dispatch_worker_injects_agent_repo(self):
+        """dispatch_worker should resolve test_repo and pass _agent_repo to worker."""
+        ticket = {"worker": "code-worker", "branch": "feature/test"}
+        result = orc.dispatch_worker(self.cfg, ticket, dry_run=True)
+        # code_worker stub succeeds in dry-run
+        self.assertTrue(result["success"])
+
+
+# ---------------------------------------------------------------------------
+# Review / Approval / Promotion (Sprint 3)
+# ---------------------------------------------------------------------------
+
+class TestReviewApprovalPromotion(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        # Create logs dirs needed by write_log
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        # Create prod_repo dir (for promotion path resolution)
+        os.makedirs(self.cfg["repo_targets"]["prod_repo"], exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put_ticket_in_review(self, ticket_id="t-rev1"):
+        """Helper: create a ticket directly in review state."""
+        _create_ticket(self.cfg, "review", ticket_id, branch="feature/test")
+        return ticket_id
+
+    def test_create_review_package(self):
+        tid = self._put_ticket_in_review()
+        pkg = orc.create_review_package(self.cfg, tid)
+        self.assertEqual(pkg["ticket_id"], tid)
+        self.assertEqual(pkg["repo_target"], "test_repo")
+        self.assertIn("created_at", pkg)
+        # File written
+        review_file = Path(self.cfg["management_root"]) / "reviews" / f"{tid}.review.json"
+        self.assertTrue(review_file.exists())
+
+    def test_review_package_requires_review_state(self):
+        _create_ticket(self.cfg, "inbox", "t-wrong-state")
+        with self.assertRaises(ValueError):
+            orc.create_review_package(self.cfg, "t-wrong-state")
+
+    def test_load_review_package(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        loaded = orc.load_review_package(self.cfg, tid)
+        self.assertEqual(loaded["ticket_id"], tid)
+
+    def test_load_review_package_missing(self):
+        with self.assertRaises(FileNotFoundError):
+            orc.load_review_package(self.cfg, "nonexistent")
+
+    def test_approve_ticket(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        record = orc.create_approval_decision(self.cfg, tid, "approved", "Looks good")
+        self.assertEqual(record["decision"], "approved")
+        self.assertEqual(record["reason"], "Looks good")
+        # Ticket should transition to done
+        state, _ = orc.find_ticket(self.cfg, tid)
+        self.assertEqual(state, "done")
+
+    def test_reject_ticket(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        record = orc.create_approval_decision(self.cfg, tid, "rejected", "Needs rework")
+        self.assertEqual(record["decision"], "rejected")
+        # Ticket should transition review → active → failed
+        state, _ = orc.find_ticket(self.cfg, tid)
+        self.assertEqual(state, "failed")
+
+    def test_reticket(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        record = orc.create_approval_decision(self.cfg, tid, "reticketed", "Different scope")
+        self.assertEqual(record["decision"], "reticketed")
+        state, _ = orc.find_ticket(self.cfg, tid)
+        self.assertEqual(state, "failed")
+
+    def test_approval_is_immutable(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        with self.assertRaises(RuntimeError) as ctx:
+            orc.create_approval_decision(self.cfg, tid, "rejected")
+        self.assertIn("immutable", str(ctx.exception))
+
+    def test_invalid_decision_rejected(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        with self.assertRaises(ValueError):
+            orc.create_approval_decision(self.cfg, tid, "maybe")
+
+    def test_approval_requires_review_package(self):
+        _create_ticket(self.cfg, "review", "t-no-review")
+        with self.assertRaises(FileNotFoundError):
+            orc.create_approval_decision(self.cfg, "t-no-review", "approved")
+
+    def test_promotion_requires_approval(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        # No approval yet → should fail
+        with self.assertRaises(FileNotFoundError):
+            orc.create_promotion_request(self.cfg, tid)
+
+    def test_promotion_requires_approved_decision(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "rejected", "Bad")
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, tid)
+        self.assertIn("not 'approved'", str(ctx.exception))
+
+    def test_promotion_success(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        request = orc.create_promotion_request(self.cfg, tid)
+        self.assertEqual(request["ticket_id"], tid)
+        self.assertEqual(request["source_repo"], "test_repo")
+        self.assertEqual(request["target_repo"], "prod_repo")
+        self.assertEqual(request["status"], "pending")
+        # File written
+        promo_file = Path(self.cfg["management_root"]) / "promotions" / f"{tid}.promotion.json"
+        self.assertTrue(promo_file.exists())
+
+    def test_promotion_dry_run(self):
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        request = orc.create_promotion_request(self.cfg, tid, dry_run=True)
+        self.assertEqual(request["status"], "dry_run")
+        # No file written in dry-run
+        promo_file = Path(self.cfg["management_root"]) / "promotions" / f"{tid}.promotion.json"
+        self.assertFalse(promo_file.exists())
 
 
 # ---------------------------------------------------------------------------
