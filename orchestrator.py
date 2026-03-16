@@ -17,6 +17,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# Domain Constants (Sprint 2 — see docs/domain-model.md)
+# ---------------------------------------------------------------------------
+
+# Canonical worker types — must match _WORKER_MODULE_MAP keys and config allowlist
+WORKER_TYPES = frozenset(["code-worker", "unity-worker", "blender-worker", "tripo-worker"])
+
+# Implemented ticket states (Sprint 1)
+TICKET_STATES = frozenset(["inbox", "ready", "active", "review", "done", "failed"])
+
+# Target ticket states (Sprint 2 model — not yet active in state machine)
+TARGET_TICKET_STATES = frozenset([
+    "draft", "triaged", "ready", "active", "qa",
+    "review", "approved", "rejected", "reticketed", "promoted", "failed",
+])
+
+# Priority levels
+PRIORITIES = frozenset(["low", "normal", "high", "critical"])
+
+# Approval decisions (Sprint 2 model — not yet active)
+APPROVAL_DECISIONS = frozenset(["approved", "rejected", "reticketed"])
+
+# Promotion targets (Sprint 2 model — not yet active)
+PROMOTION_TARGETS = frozenset(["staging_target", "promotion_target", "prod_target"])
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
