@@ -412,13 +412,15 @@ def cmd_qa_pass(cfg, args):
     """Mark QA as passed for a ticket."""
     try:
         record = create_qa_result(cfg, args.ticket_id, True,
-                                  notes=args.notes or "")
+                                  notes=args.notes or "",
+                                  decision="pass")
         print(f"QA PASSED: {args.ticket_id}")
+        print(f"  Decision:     pass")
         print(f"  Validated at: {record['validated_at']}")
         if args.notes:
             print(f"  Notes: {args.notes}")
         return 0
-    except (FileNotFoundError, RuntimeError) as e:
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
         print(f"ERROR: {e}")
         return 1
 
@@ -427,13 +429,33 @@ def cmd_qa_fail(cfg, args):
     """Mark QA as failed for a ticket."""
     try:
         record = create_qa_result(cfg, args.ticket_id, False,
-                                  notes=args.notes or "")
+                                  notes=args.notes or "",
+                                  decision="fail")
         print(f"QA FAILED: {args.ticket_id}")
+        print(f"  Decision:     fail")
         print(f"  Validated at: {record['validated_at']}")
         if args.notes:
             print(f"  Notes: {args.notes}")
         return 0
-    except (FileNotFoundError, RuntimeError) as e:
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
+def cmd_qa_decide(cfg, args):
+    """Record a QA decision for a ticket (pass/fail/blocked/inconclusive)."""
+    try:
+        record = create_qa_result(cfg, args.ticket_id, False,
+                                  notes=args.notes or "",
+                                  decision=args.decision)
+        label = "PASSED" if record["passed"] else "NOT PASSED"
+        print(f"QA {label}: {args.ticket_id}")
+        print(f"  Decision:     {record['decision']}")
+        print(f"  Validated at: {record['validated_at']}")
+        if args.notes:
+            print(f"  Notes: {args.notes}")
+        return 0 if record["passed"] else 1
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
         print(f"ERROR: {e}")
         return 1
 
@@ -443,8 +465,10 @@ def cmd_qa_check(cfg, args):
     try:
         qa = load_qa_result(cfg, args.ticket_id)
         status = "PASSED" if qa.get("passed") else "FAILED"
+        decision = qa.get("decision", "pass" if qa.get("passed") else "fail")
         print(f"QA Status: {args.ticket_id}")
         print(f"  Result:    {status}")
+        print(f"  Decision:  {decision}")
         print(f"  Validated: {qa.get('validated_at', '?')}")
         print(f"  Validator: {qa.get('validator', '?')}")
         if qa.get("notes"):
@@ -453,7 +477,7 @@ def cmd_qa_check(cfg, args):
     except FileNotFoundError:
         print(f"QA Status: {args.ticket_id}")
         print("  Result: NOT YET VALIDATED")
-        print("  Use 'qa-pass' or 'qa-fail' to record a QA result.")
+        print("  Use 'qa-pass', 'qa-fail', or 'qa-decide' to record a QA result.")
         return 1
 
 
@@ -937,6 +961,15 @@ def main():
     p_qa_fail.add_argument("ticket_id", help="Ticket ID")
     p_qa_fail.add_argument("--notes", default="", help="QA notes")
 
+    # qa-decide
+    p_qa_decide = sub.add_parser("qa-decide",
+                                  help="Record QA decision (pass/fail/blocked/inconclusive)")
+    p_qa_decide.add_argument("ticket_id", help="Ticket ID")
+    p_qa_decide.add_argument("decision",
+                              choices=["pass", "fail", "blocked", "inconclusive"],
+                              help="QA decision")
+    p_qa_decide.add_argument("--notes", default="", help="QA notes")
+
     # qa-check
     p_qa_check = sub.add_parser("qa-check", help="Show QA status for a ticket")
     p_qa_check.add_argument("ticket_id", help="Ticket ID")
@@ -1038,6 +1071,7 @@ def main():
         "promotion-check": cmd_promotion_check,
         "qa-pass": cmd_qa_pass,
         "qa-fail": cmd_qa_fail,
+        "qa-decide": cmd_qa_decide,
         "qa-check": cmd_qa_check,
         "promotion-status": cmd_promotion_status,
         "audit-show": cmd_audit_show,
