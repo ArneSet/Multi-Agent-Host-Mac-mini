@@ -425,9 +425,15 @@ class TestRepoTargeting(unittest.TestCase):
 
     def test_dispatch_worker_injects_agent_repo(self):
         """dispatch_worker should resolve test_repo and pass _agent_repo to worker."""
-        ticket = {"worker": "code-worker", "branch": "feature/test"}
+        ticket = {
+            "id": "test-dispatch-001",
+            "title": "Test dispatch",
+            "worker": "code-worker",
+            "branch": "feature/test",
+            "description": "target_file: test.txt\n---\ntest content",
+        }
         result = orc.dispatch_worker(self.cfg, ticket, dry_run=True)
-        # code_worker stub succeeds in dry-run
+        # code_worker succeeds in dry-run with valid inputs
         self.assertTrue(result["success"])
 
 
