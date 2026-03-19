@@ -738,10 +738,21 @@ def load_approval_decision(cfg: dict, ticket_id: str) -> dict:
         return json.load(f)
 
 
+_QA_DECISIONS = {"pass", "fail", "blocked", "inconclusive"}
+
+
 def create_qa_result(cfg: dict, ticket_id: str, passed: bool,
-                     notes: str = "") -> dict:
+                     notes: str = "",
+                     decision: str = "",
+                     worker_class: str = "",
+                     checked_artifacts: list = None) -> dict:
     """Record a QA validation result for a ticket. Requires existing ReviewPackage.
-    QA results are immutable — once recorded, cannot be changed."""
+    QA results are immutable — once recorded, cannot be changed.
+
+    If *decision* is provided it must be one of: pass, fail, blocked, inconclusive.
+    *passed* is then derived from decision (True iff decision=="pass").
+    If *decision* is omitted, it is inferred from *passed* for backward compatibility.
+    """
     ticket_id = sanitize_ticket_id(ticket_id)
     load_review_package(cfg, ticket_id)
 
@@ -752,19 +763,37 @@ def create_qa_result(cfg: dict, ticket_id: str, passed: bool,
             "Results are immutable."
         )
 
+    # Resolve decision vs passed
+    if decision:
+        if decision not in _QA_DECISIONS:
+            raise ValueError(
+                f"Invalid QA decision: '{decision}'. "
+                f"Valid: {sorted(_QA_DECISIONS)}"
+            )
+        passed = (decision == "pass")
+    else:
+        decision = "pass" if passed else "fail"
+
     record = {
+        "schema_version": 2,
         "ticket_id": ticket_id,
-        "passed": bool(passed),
+        "decision": decision,
+        "passed": passed,
         "notes": notes,
         "validated_at": _now(),
         "validator": "creative-director",
     }
 
+    if worker_class:
+        record["worker_class"] = worker_class
+    if checked_artifacts:
+        record["checked_artifacts"] = list(checked_artifacts)
+
     with open(qa_path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
 
     write_log(cfg, "orchestrator", ticket_id,
-              f"QA result: {'PASSED' if passed else 'FAILED'} — {notes or '(no notes)'}")
+              f"QA result: {decision} — {notes or '(no notes)'}")
     return record
 
 

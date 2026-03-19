@@ -764,6 +764,60 @@ class TestQAGate(unittest.TestCase):
         names = [c["name"] for c in result["checks"]]
         self.assertIn("qa_gate", names)
 
+    # --- Sprint 11B: QA decision field tests ---
+
+    def test_qa_decision_pass(self):
+        """QA with decision=pass sets passed=True and includes schema_version."""
+        tid = self._put_ticket_in_review()
+        orc.create_review_package(self.cfg, tid)
+        result = orc.create_qa_result(self.cfg, tid, False, decision="pass")
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["decision"], "pass")
+        self.assertEqual(result["schema_version"], 2)
+
+    def test_qa_decision_blocked(self):
+        """QA with decision=blocked sets passed=False."""
+        tid = self._put_ticket_in_review("t-qa-blocked")
+        orc.create_review_package(self.cfg, "t-qa-blocked")
+        result = orc.create_qa_result(self.cfg, "t-qa-blocked", True,
+                                       decision="blocked", notes="BLOCKED: missing artifacts")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["decision"], "blocked")
+
+    def test_qa_decision_inconclusive(self):
+        """QA with decision=inconclusive sets passed=False."""
+        tid = self._put_ticket_in_review("t-qa-inc")
+        orc.create_review_package(self.cfg, "t-qa-inc")
+        result = orc.create_qa_result(self.cfg, "t-qa-inc", True,
+                                       decision="inconclusive")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["decision"], "inconclusive")
+
+    def test_qa_invalid_decision(self):
+        """Invalid QA decision raises ValueError."""
+        tid = self._put_ticket_in_review("t-qa-invalid")
+        orc.create_review_package(self.cfg, "t-qa-invalid")
+        with self.assertRaises(ValueError):
+            orc.create_qa_result(self.cfg, "t-qa-invalid", True, decision="maybe")
+
+    def test_qa_legacy_compat(self):
+        """Legacy call without decision still works, infers decision from passed."""
+        tid = self._put_ticket_in_review("t-qa-legacy")
+        orc.create_review_package(self.cfg, "t-qa-legacy")
+        result = orc.create_qa_result(self.cfg, "t-qa-legacy", True, "old style")
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["decision"], "pass")
+
+    def test_promotion_blocked_qa_blocked(self):
+        """Promotion blocked when QA decision is 'blocked'."""
+        tid = self._put_ticket_in_review("t-qa-promo-blk")
+        orc.create_review_package(self.cfg, "t-qa-promo-blk")
+        orc.create_approval_decision(self.cfg, "t-qa-promo-blk", "approved")
+        orc.create_qa_result(self.cfg, "t-qa-promo-blk", False, decision="blocked")
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, "t-qa-promo-blk")
+        self.assertIn("QA has not passed", str(ctx.exception))
+
 
 # ---------------------------------------------------------------------------
 # Promotion execution (Sprint 5)

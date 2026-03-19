@@ -18,39 +18,45 @@ A minimal, immutable **QA validation artifact** stored as JSON alongside the rev
 
 ```json
 {
+  "schema_version": 2,
   "ticket_id": "TICKET-001",
+  "decision": "pass",
   "passed": true,
-  "notes": "All acceptance criteria met, tested on feature branch",
+  "notes": "All structural checks passed. File exists, non-empty, changeset complete.",
   "validated_at": "2026-03-16T12:00:00Z",
   "validator": "creative-director"
 }
 ```
 
 **File:** `reviews/<ticket_id>.qa.json`
+**Schema:** See `docs/qa-record-schema.md` for full field definitions.
 
 ### Functions
 
 | Function | Purpose |
 |----------|---------|
-| `create_qa_result(cfg, ticket_id, passed, notes)` | Record QA passed/failed. Requires ReviewPackage. Immutable. |
+| `create_qa_result(cfg, ticket_id, passed, notes, decision, ...)` | Record QA decision. Requires ReviewPackage. Immutable. |
 | `load_qa_result(cfg, ticket_id)` | Load existing QA result |
 
 ### CLI Commands
 
 | Command | Purpose |
 |---------|---------|
-| `qa-pass TICKET_ID [--notes TEXT]` | Mark QA as passed |
-| `qa-fail TICKET_ID [--notes TEXT]` | Mark QA as failed |
+| `qa-pass TICKET_ID [--notes TEXT]` | Shortcut: mark QA as passed (decision=pass) |
+| `qa-fail TICKET_ID [--notes TEXT]` | Shortcut: mark QA as failed (decision=fail) |
+| `qa-decide TICKET_ID DECISION [--notes TEXT]` | Record any QA decision (pass/fail/blocked/inconclusive) |
 | `qa-check TICKET_ID` | Show current QA status |
 
 ## What Constitutes "QA Passed"
 
-The Creative Director explicitly marks a ticket as QA-passed after:
-1. Reviewing the ReviewPackage (artifacts, worker log, branch)
-2. Verifying acceptance criteria are met
-3. Confirming the work is ready for production
+The Creative Director records a QA result after verifying that worker output is **structurally sound and complete**:
+1. For Mutation Workers: files exist in test_repo, are non-empty, changeset/manifest present
+2. For Validation Workers: artifacts exist and are non-empty, report is interpretable
+3. No security boundary violations detected
 
-This is a **manual, human-in-the-loop** decision — not automated testing.
+This is a **technical gate** — not a creative quality judgment.
+Acceptance criteria and production readiness are assessed during **Review**, not QA.
+See `docs/qa-worker-classes.md` and `docs/qa-decision-model.md` for details.
 
 ## How QA Affects Promotion Readiness
 
