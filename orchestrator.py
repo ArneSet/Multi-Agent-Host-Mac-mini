@@ -512,6 +512,25 @@ def _process_ticket_inner(cfg: dict, ticket_id: str, dry_run: bool) -> int:
     if result.get("artifacts"):
         write_log(cfg, "worker", ticket_id, f"Artifacts: {result['artifacts']}")
 
+    # --- Output validation (Sprint 10A) ---
+    # If worker reports success, verify that real output was produced.
+    # Prevents silent success with no actual work done.
+    if result["success"] and not dry_run:
+        validation = validate_worker_output(cfg, ticket_id, result)
+        if not validation["valid"]:
+            result["success"] = False
+            result["message"] = (
+                f"Output validation FAILED: {validation['reason']}. "
+                f"Original: {result['message']}"
+            )
+            write_log(cfg, "orchestrator", ticket_id,
+                       f"Output validation failed: {validation['reason']}")
+            print(f"Output validation: FAILED — {validation['reason']}")
+        else:
+            write_log(cfg, "orchestrator", ticket_id,
+                       f"Output validation passed: {validation['detail']}")
+            print(f"Output validation: PASSED")
+
     # Transition based on result
     if result["success"]:
         target = "review"
@@ -524,6 +543,77 @@ def _process_ticket_inner(cfg: dict, ticket_id: str, dry_run: bool) -> int:
     write_log(cfg, "orchestrator", ticket_id, msg)
 
     return 0 if result["success"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Worker Output Validation (Sprint 10A)
+# ---------------------------------------------------------------------------
+
+def validate_worker_output(cfg: dict, ticket_id: str, result: dict) -> dict:
+    """
+    Validate that a worker's reported success is backed by real output.
+
+    Checks:
+    1. files_written non-empty OR artifacts non-empty (validation workers)
+    2. changeset metadata exists (if changeset_dir provided)
+    3. artifact files exist
+    4. written files exist in test_repo and are non-empty
+
+    Returns: {"valid": bool, "reason": str|None, "detail": str}
+    """
+    mgmt = Path(cfg["management_root"]).expanduser().resolve()
+
+    # 1. Check that the worker produced *something*
+    files_written = result.get("files_written", [])
+    artifacts = result.get("artifacts", [])
+    if not files_written and not artifacts:
+        return {"valid": False,
+                "reason": "Worker reported success but produced no files and no artifacts.",
+                "detail": ""}
+
+    # 2. Check changeset metadata exists
+    changeset_dir = result.get("changeset_dir")
+    if changeset_dir:
+        cs_path = mgmt / changeset_dir / "metadata" / "changeset.json"
+        manifest_path = mgmt / changeset_dir / "metadata" / "manifest.json"
+        if not cs_path.exists():
+            return {"valid": False, "reason": f"changeset.json missing at {cs_path}",
+                    "detail": ""}
+        if not manifest_path.exists():
+            return {"valid": False, "reason": f"manifest.json missing at {manifest_path}",
+                    "detail": ""}
+
+    # 3. Check artifact file exists
+    artifacts = result.get("artifacts", [])
+    for art in artifacts:
+        art_path = mgmt / art
+        if not art_path.exists():
+            return {"valid": False, "reason": f"Artifact file missing: {art}",
+                    "detail": ""}
+
+    # 4. Verify written files exist in test_repo and are non-empty
+    agent_repo = cfg.get("_agent_repo", "")
+    if agent_repo:
+        repo_path = Path(agent_repo).expanduser().resolve()
+        for rel_file in files_written:
+            full_path = repo_path / rel_file
+            if not full_path.exists():
+                return {"valid": False,
+                        "reason": f"Written file not found in test_repo: {rel_file}",
+                        "detail": ""}
+            if full_path.stat().st_size == 0:
+                return {"valid": False,
+                        "reason": f"Written file is empty: {rel_file}",
+                        "detail": ""}
+
+    worker_class = "mutation" if files_written else "validation"
+    detail = (
+        f"class={worker_class}, "
+        f"{len(files_written)} file(s) verified in test_repo, "
+        f"{len(artifacts)} artifact(s), "
+        f"changeset_dir={'present' if changeset_dir else 'absent'}"
+    )
+    return {"valid": True, "reason": None, "detail": detail}
 
 
 # ---------------------------------------------------------------------------
