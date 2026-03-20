@@ -22,7 +22,8 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
             "files_written": [],
         }
 
-    artifacts_dir = Path(cfg["management_root"]) / cfg["artifacts_dir"]
+    mgmt = Path(cfg["management_root"]).expanduser().resolve()
+    artifacts_dir = mgmt / cfg["artifacts_dir"]
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     artifact_path = artifacts_dir / f"{ticket_id}_tripo_result.md"
@@ -41,7 +42,7 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
     return {
         "success": True,
         "message": f"tripo-worker validated '{title}' (stub). No API calls made.",
-        "artifacts": [str(artifact_path)],
+        "artifacts": [str(artifact_path.relative_to(mgmt))],
         "changeset_dir": None,
         "files_written": [],
     }

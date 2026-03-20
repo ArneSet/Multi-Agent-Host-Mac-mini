@@ -269,6 +269,22 @@ class TestDispatchWorker(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("No module mapping", result["message"])
 
+    def test_stub_worker_returns_relative_artifact_path(self):
+        """Stub workers must return artifact paths relative to management_root."""
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+        self.cfg["allowed_workers"].append("blender-worker")
+        ticket = {"id": "t-stub1", "title": "stub test", "worker": "blender-worker",
+                  "branch": "feature/test", "description": "test"}
+        result = orc.dispatch_worker(self.cfg, ticket)
+        self.assertTrue(result["success"], f"Worker failed: {result['message']}")
+        self.assertEqual(len(result["artifacts"]), 1)
+        art = result["artifacts"][0]
+        # Must be relative (not absolute), and must resolve under management_root
+        self.assertFalse(art.startswith("/"), f"Artifact path is absolute: {art}")
+        self.assertTrue((mgmt / art).exists(), f"Artifact not found: {mgmt / art}")
+
 
 # ---------------------------------------------------------------------------
 # write_log
@@ -731,6 +747,49 @@ class TestPromotionReadiness(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             orc.create_promotion_request(self.cfg, tid)
         self.assertIn("REPO SEPARATION VIOLATION", str(ctx.exception))
+
+    def test_readiness_artifacts_exist(self):
+        """Promotion readiness passes when referenced artifacts exist on disk."""
+        tid = self._put_ticket_in_review()
+        # Create a real artifact file so ReviewPackage picks it up
+        mgmt = Path(self.cfg["management_root"])
+        artifacts_dir = mgmt / self.cfg["artifacts_dir"]
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / f"{tid}_code_result.md").write_text("test artifact")
+        orc.create_review_package(self.cfg, tid)
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertTrue(result["ready"])
+        art_check = [c for c in result["checks"] if c["name"] == "artifacts_exist"]
+        self.assertEqual(len(art_check), 1)
+        self.assertTrue(art_check[0]["passed"])
+
+    def test_readiness_fails_missing_artifact(self):
+        """Promotion readiness fails when a referenced artifact is deleted."""
+        tid = self._put_ticket_in_review()
+        mgmt = Path(self.cfg["management_root"])
+        artifacts_dir = mgmt / self.cfg["artifacts_dir"]
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        art_file = artifacts_dir / f"{tid}_code_result.md"
+        art_file.write_text("test artifact")
+        orc.create_review_package(self.cfg, tid)
+        # Delete artifact after ReviewPackage references it
+        art_file.unlink()
+        orc.create_approval_decision(self.cfg, tid, "approved")
+        orc.create_qa_result(self.cfg, tid, True)
+        result = orc.check_promotion_readiness(self.cfg, tid)
+        self.assertFalse(result["ready"])
+        names = {c["name"] for c in result["checks"] if not c["passed"]}
+        self.assertIn("artifacts_exist", names)
+
+    def test_readiness_no_review_skips_artifact_check(self):
+        """If ReviewPackage is missing, artifact check is skipped (not crashed)."""
+        _create_ticket(self.cfg, "review", "t-norev2")
+        result = orc.check_promotion_readiness(self.cfg, "t-norev2")
+        self.assertFalse(result["ready"])
+        art_checks = [c for c in result["checks"] if c["name"] == "artifacts_exist"]
+        self.assertEqual(len(art_checks), 0)  # skipped, not failed
 
 
 # ---------------------------------------------------------------------------
