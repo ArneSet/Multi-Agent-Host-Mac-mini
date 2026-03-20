@@ -650,11 +650,11 @@ def create_review_package(cfg: dict, ticket_id: str) -> dict:
     ticket = parse_ticket(path)
     mgmt = Path(cfg["management_root"])
 
-    # Gather artifacts
+    # Gather artifacts (underscore separator prevents prefix collisions)
     artifacts_dir = mgmt / cfg["artifacts_dir"]
     artifacts = []
     if artifacts_dir.exists():
-        for f in artifacts_dir.glob(f"{ticket_id}*"):
+        for f in artifacts_dir.glob(f"{ticket_id}_*"):
             artifacts.append(str(f.relative_to(mgmt)))
 
     # Gather worker log

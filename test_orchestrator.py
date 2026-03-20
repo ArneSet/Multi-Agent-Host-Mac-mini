@@ -791,6 +791,26 @@ class TestPromotionReadiness(unittest.TestCase):
         art_checks = [c for c in result["checks"] if c["name"] == "artifacts_exist"]
         self.assertEqual(len(art_checks), 0)  # skipped, not failed
 
+    def test_review_package_artifacts_no_prefix_collision(self):
+        """ReviewPackage glob must not pick up artifacts from prefix-colliding ticket IDs."""
+        mgmt = Path(self.cfg["management_root"])
+        artifacts_dir = mgmt / self.cfg["artifacts_dir"]
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create artifact for our ticket
+        (artifacts_dir / "t-glob_code_result.md").write_text("real", encoding="utf-8")
+        # Create artifact for a prefix-colliding ticket
+        (artifacts_dir / "t-glob-extra_code_result.md").write_text("collider", encoding="utf-8")
+
+        _create_ticket(self.cfg, "review", "t-glob")
+        pkg = orc.create_review_package(self.cfg, "t-glob")
+
+        # Only the exact ticket's artifact should be included
+        self.assertEqual(len(pkg["artifacts"]), 1)
+        self.assertIn("t-glob_code_result.md", pkg["artifacts"][0])
+        for a in pkg["artifacts"]:
+            self.assertNotIn("t-glob-extra", a)
+
 
 # ---------------------------------------------------------------------------
 # QA Gate (Sprint 5)
