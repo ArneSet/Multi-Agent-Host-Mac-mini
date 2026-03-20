@@ -412,6 +412,8 @@ def dispatch_worker(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
             "success": False,
             "message": f"Unknown or disallowed worker: {worker_name}. Allowed: {allowed}",
             "artifacts": [],
+            "changeset_dir": None,
+            "files_written": [],
         }
 
     module_name = _WORKER_MODULE_MAP.get(worker_name)
@@ -420,6 +422,8 @@ def dispatch_worker(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
             "success": False,
             "message": f"No module mapping for worker '{worker_name}' — check _WORKER_MODULE_MAP",
             "artifacts": [],
+            "changeset_dir": None,
+            "files_written": [],
         }
 
     # Validate module_name is a simple identifier (no dots, slashes, traversal)
@@ -428,6 +432,8 @@ def dispatch_worker(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
             "success": False,
             "message": f"Invalid module name: '{module_name}'",
             "artifacts": [],
+            "changeset_dir": None,
+            "files_written": [],
         }
 
     # Enforce: workers always target test_repo, never prod_repo
@@ -442,10 +448,10 @@ def dispatch_worker(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
         mod = __import__(f"workers.{module_name}", fromlist=[module_name])
         worker_fn = getattr(mod, "execute", None)
         if not worker_fn or not callable(worker_fn):
-            return {"success": False, "message": f"Worker {module_name} has no callable execute()", "artifacts": []}
+            return {"success": False, "message": f"Worker {module_name} has no callable execute()", "artifacts": [], "changeset_dir": None, "files_written": []}
         return worker_fn(worker_cfg, ticket, dry_run=dry_run)
     except ImportError as e:
-        return {"success": False, "message": f"Failed to import worker {module_name}: {e}", "artifacts": []}
+        return {"success": False, "message": f"Failed to import worker {module_name}: {e}", "artifacts": [], "changeset_dir": None, "files_written": []}
     finally:
         sys.path.pop(0)
 
@@ -703,6 +709,7 @@ def create_approval_decision(cfg: dict, ticket_id: str, decision: str,
         )
 
     record = {
+        "schema_version": 1,
         "ticket_id": ticket_id,
         "decision": decision,
         "reviewer": "creative-director",
@@ -739,6 +746,32 @@ def load_approval_decision(cfg: dict, ticket_id: str) -> dict:
 
 
 _QA_DECISIONS = {"pass", "fail", "blocked", "inconclusive"}
+
+
+def _qa_is_promotable(qa: dict) -> bool:
+    """Canonical QA promotability check.  Sprint 11B hardening.
+
+    Rules:
+    1. If 'decision' is present, it is the canonical source of truth.
+       Only decision=="pass" is promotable.
+    2. If 'decision' is absent (legacy v1), fall back to qa.get("passed").
+    3. If 'decision' and 'passed' contradict each other, reject.
+    """
+    decision = qa.get("decision")
+    passed = qa.get("passed")
+
+    if decision is not None:
+        # decision is canonical
+        decision_says_pass = (decision == "pass")
+        if passed is not None and passed != decision_says_pass:
+            raise ValueError(
+                f"QA record integrity error: decision='{decision}' "
+                f"contradicts passed={passed}. Record is untrusted."
+            )
+        return decision_says_pass
+
+    # Legacy v1: no decision field, fall back to passed bool
+    return bool(passed)
 
 
 def create_qa_result(cfg: dict, ticket_id: str, passed: bool,
@@ -842,15 +875,23 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
         checks.append({"name": "approval_decision", "passed": False,
                         "detail": "No ApprovalDecision found"})
 
-    # 3. QA gate passed (Sprint 5)
+    # 3. QA gate passed (Sprint 5 + Sprint 11B canonical check)
     try:
         qa = load_qa_result(cfg, ticket_id)
-        if qa.get("passed"):
-            checks.append({"name": "qa_gate", "passed": True,
-                            "detail": f"QA passed ({qa.get('validated_at', '?')})"})
-        else:
+        try:
+            promotable = _qa_is_promotable(qa)
+        except ValueError as e:
+            promotable = False
             checks.append({"name": "qa_gate", "passed": False,
-                            "detail": f"QA failed: {qa.get('notes', '(no notes)')}"})
+                            "detail": str(e)})
+        else:
+            if promotable:
+                checks.append({"name": "qa_gate", "passed": True,
+                                "detail": f"QA passed ({qa.get('validated_at', '?')})"})
+            else:
+                decision = qa.get('decision', '?')
+                checks.append({"name": "qa_gate", "passed": False,
+                                "detail": f"QA not promotable (decision={decision}): {qa.get('notes', '(no notes)')}"})
     except FileNotFoundError:
         checks.append({"name": "qa_gate", "passed": False,
                         "detail": "No QA result found"})
@@ -907,9 +948,9 @@ def create_promotion_request(cfg: dict, ticket_id: str,
             f"'{approval['decision']}', not 'approved'."
         )
 
-    # Verify QA gate passed (Sprint 5)
+    # Verify QA gate passed (Sprint 5 + Sprint 11B canonical check)
     qa = load_qa_result(cfg, ticket_id)
-    if not qa.get("passed"):
+    if not _qa_is_promotable(qa):
         raise ValueError(
             f"Cannot promote: ticket '{ticket_id}' QA has not passed."
         )

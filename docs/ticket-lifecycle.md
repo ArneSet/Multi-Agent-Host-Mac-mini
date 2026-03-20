@@ -1,20 +1,19 @@
 # HYBRIS Agent Host — Ticket Lifecycle
 
-> **Letzte Aktualisierung:** 2026-03-16  
-> **Branch:** `feature/sprint-2-domain-model`  
-> **Status:** Sprint 2 — Target Lifecycle modelliert, Implemented Lifecycle aktiv  
+> **Letzte Aktualisierung:** 2026-03-20
+> **Status:** Sprint 11C — aktualisiert auf Code-Iststand
 
 ---
 
-## Implementierter Lifecycle (Sprint 1)
+## Implementierter Lifecycle (Sprint 1–11)
 
-Dies ist der aktuell im Code aktive Lebenszyklus.
+Dies ist der aktuell im Code aktive Lebenszyklus, verifiziert gegen `config.json` und `orchestrator.py`.
 
 ```
 inbox ──▶ ready ──▶ active ──▶ review ──▶ done
                        │         │
                        ▼         ▼
-                     failed    active (rework)
+                     failed    active (rework → failed)
                        │
                        ▼
                      ready (retry)
@@ -27,110 +26,96 @@ inbox ──▶ ready ──▶ active ──▶ review ──▶ done
 | `inbox` | `tickets/inbox/` | Neu eingegangen, noch nicht geprüft |
 | `ready` | `tickets/ready/` | Validiert, Worker identifiziert, bereit zur Verarbeitung |
 | `active` | `tickets/active/` | Worker arbeitet daran |
-| `review` | `tickets/review/` | Worker fertig, wartet auf Abnahme |
-| `done` | `tickets/done/` | Abgenommen und abgeschlossen |
+| `review` | `tickets/review/` | Worker fertig, wartet auf QA und Abnahme |
+| `done` | `tickets/done/` | Abgenommen, bereit für Promotion-Pipeline |
 | `failed` | `tickets/failed/` | Fehlgeschlagen |
+
+**Quelle:** `config.json` → `ticket_states`
 
 ### Implementierte Transitionen
 
-| Von | Nach | Auslöser |
-|-----|------|----------|
-| `inbox` → `ready` | Ticket validiert, Worker identifiziert |
-| `ready` → `active` | Orchestrator nimmt Ticket auf (Branch-Validierung, max_active geprüft) |
-| `active` → `review` | Worker meldet Erfolg |
-| `active` → `failed` | Worker meldet Fehler oder Abbruch |
-| `review` → `done` | Creative Director gibt frei |
-| `review` → `active` | Rework angefordert |
-| `failed` → `ready` | Problem behoben, Retry freigegeben |
-
-**Quelle:** `config.json` → `valid_transitions`, `orchestrator.py` → `transition_ticket()`
-
----
-
-## Target Lifecycle (Sprint 2 Modell)
-
-Dies ist der angestrebte, vollständige Lebenszyklus. Noch nicht im Code implementiert.
-
-```
-draft ──▶ triaged ──▶ ready ──▶ active ──▶ qa ──▶ review ──▶ approved ──▶ promoted
-                        │         │                  │          │
-                        │         ▼                  │          ▼
-                        │       failed               │      rejected
-                        │         │                  │          │
-                        │         ▼                  │          ▼
-                        │       ready (retry)        │      reticketed
-                        │                            │
-                        ▼                            ▼
-                   ready (retry)              active (rework)
-```
-
-### Target Zustände
-
-| Zustand | Bedeutung | Implementiert |
-|---------|-----------|:-------------:|
-| `draft` | Erstellt, noch nicht triagiert | — |
-| `triaged` | Director GPT hat priorisiert und Worker zugewiesen | — |
-| `ready` | Bereit zur Verarbeitung | ✓ (deckt `inbox`+`ready` ab) |
-| `active` | Worker arbeitet | ✓ |
-| `qa` | Automatische/manuelle Qualitätsprüfung | — |
-| `review` | Wartet auf Creative-Director-Abnahme | ✓ |
-| `approved` | Abgenommen, bereit zur Promotion | — |
-| `rejected` | Abgelehnt, erfordert Neubewertung | — |
-| `reticketed` | Aufgeteilt oder neu formuliert als neues Ticket | — |
-| `promoted` | In Zielumgebung übernommen | — |
-| `failed` | Technisch fehlgeschlagen | ✓ |
-
-### Target Transitionen
-
 | Von | Nach | Auslöser | Autorität |
 |-----|------|----------|-----------|
-| `draft` → `triaged` | Director GPT triagiert | Director GPT |
-| `triaged` → `ready` | Orchestrator validiert Ticket | Orchestrator |
-| `ready` → `active` | Orchestrator dispatcht Worker | Orchestrator |
-| `active` → `qa` | Worker meldet Erfolg | Worker / Orchestrator |
-| `active` → `failed` | Worker meldet Fehler | Worker / Orchestrator |
-| `qa` → `review` | QA bestanden | QA / Orchestrator |
-| `qa` → `failed` | QA fehlgeschlagen | QA / Orchestrator |
-| `review` → `approved` | Creative Director gibt frei | Creative Director |
-| `review` → `rejected` | Creative Director lehnt ab | Creative Director |
-| `rejected` → `reticketed` | Wird als neues Ticket reformuliert | Director GPT |
-| `approved` → `promoted` | In Zielumgebung übernommen | Orchestrator (nur nach CD-Approval) |
-| `failed` → `ready` | Problem behoben, Retry | Director GPT / Orchestrator |
+| `inbox` → `ready` | Ticket validiert, Worker identifiziert | Orchestrator / Operator |
+| `ready` → `active` | Branch-Validierung + max_active geprüft | Orchestrator |
+| `active` → `review` | Worker meldet Erfolg + Output Validation bestanden | Orchestrator |
+| `active` → `failed` | Worker meldet Fehler oder Output Validation fehlgeschlagen | Orchestrator |
+| `review` → `done` | `create_approval_decision()` mit `decision: "approved"` | Creative Director |
+| `review` → `active` → `failed` | `create_approval_decision()` mit `decision: "rejected"` oder `"reticketed"` | Creative Director |
+| `failed` → `ready` | Problem behoben, Retry freigegeben | Operator |
+
+**Quelle:** `config.json` → `valid_transitions`, `orchestrator.py` → `transition_ticket()`, `create_approval_decision()`
+
+### Sicherheits-Guards bei Transitionen
+
+| Guard | Transition | Enforcement |
+|-------|-----------|-------------|
+| Branch-Validierung | ready → active | `validate_branch()` — kein protected Branch, kein Traversal |
+| max_active_tickets | ready → active | Maximal 1 aktives Ticket (konfigurierbar) |
+| Output Validation | active → review | `validate_worker_output()` muss bestehen |
+| ReviewPackage Pflicht | review → done/failed (via approval) | `create_approval_decision()` ruft `load_review_package()` |
 
 ---
 
-## Reconciliation: Implemented ↔ Target
+## Review-Phase im Detail (Sprint 5–11B)
 
-| Implemented | Target-Äquivalent | Migration |
-|-------------|-------------------|-----------|
-| `inbox` | `draft` + `triaged` | `inbox` wird zu `draft`; `triaged` ist neu |
-| `ready` | `ready` | Identisch |
-| `active` | `active` | Identisch |
-| — | `qa` | Neuer Zustand in Sprint 3+ |
-| `review` | `review` | Identisch |
-| — | `approved` | Neuer Zustand, aktuell in `review` → `done` zusammengefasst |
-| — | `rejected` | Neuer Zustand, aktuell als `review` → `active` (rework) behandelt |
-| — | `reticketed` | Neuer Zustand, manueller Prozess |
-| `done` | `promoted` | `done` wird zu `promoted` |
-| `failed` | `failed` | Identisch |
+Die `review`-Phase umfasst mehrere unabhängige, persistierte Records:
 
-### Migrationsstrategie
+```
+Ticket in review
+    ↓
+1. create_review_package()     → ReviewPackage   (reviews/{id}.review.json)
+    ↓
+2. create_qa_result()          → QA Record       (reviews/{id}.qa.json)
+    ↓
+3. create_approval_decision()  → Approval        (reviews/{id}.approval.json)
+    ↓                            Ticket → done
+4. check_promotion_readiness() → 6 Checks müssen bestehen
+    ↓
+5. create_promotion_request()  → PromotionRequest (promotions/{id}.promotion.json)
+    ↓
+6. execute_promotion()         → git fetch in prod_repo (manuell ausgelöst)
+```
 
-**Konservativ:** Der implementierte Lifecycle bleibt in Sprint 2 unverändert. Die Target-States werden nur dokumentiert. Migration erfolgt schrittweise:
+**Empfohlene Reihenfolge:** QA → Approval → PromotionRequest.
+**Nicht hart erzwungen im Code:** Approval kann vor QA aufgezeichnet werden. Die Promotion-Gates prüfen beides unabhängig.
 
-- **Sprint 3:** `qa` und `approved`/`rejected` einführen
-- **Sprint 4:** `promoted` + PromotionTarget-Anbindung
-- **Sprint 5:** `draft`/`triaged` mit externem Intake
+### Gate-Übersicht
 
-Der Code bricht nicht, weil nur neue Zustände hinzukommen und bestehende Transitionen erhalten bleiben.
+| Gate | Typ | Wann | Blockiert was |
+|------|-----|------|---------------|
+| Output Validation | automatisch | nach Worker-Dispatch | Ticket → review (bei Fehler: → failed) |
+| QA Gate | manuell | in review | Promotion (bei Fehler: blockiert PromotionRequest) |
+| Approval | manuell | in review | Promotion (bei Fehler: blockiert PromotionRequest) |
+| Promotion Readiness | automatisch | bei PromotionRequest | 6 Checks, alle müssen bestehen |
+
+---
+
+## Nicht implementierte Zielzustände (Sprint 2 Modell — historisch)
+
+Die folgenden Zustände wurden in Sprint 2 als Zielmodell dokumentiert. Sie sind **nicht im Code implementiert** und werden hier nur als historische Referenz beibehalten.
+
+| Zustand | Bedeutung | Status |
+|---------|-----------|--------|
+| `draft` | Erstellt, noch nicht triagiert | nicht implementiert |
+| `triaged` | Director GPT hat priorisiert | nicht implementiert |
+| `qa` | Eigenständiger QA-Zustand | nicht implementiert (QA läuft innerhalb `review`) |
+| `approved` | Eigenständiger Approved-Zustand | nicht implementiert (via `done` + ApprovalDecision) |
+| `rejected` | Eigenständiger Rejected-Zustand | nicht implementiert (via `failed` + ApprovalDecision) |
+| `reticketed` | Eigenständiger Reticketed-Zustand | nicht implementiert (via `failed` + ApprovalDecision) |
+| `promoted` | Eigenständiger Promoted-Zustand | nicht implementiert (via `done` + PromotionRequest) |
+
+**Bewertung (Sprint 11C):** Die meisten Zielzustände werden aktuell durch die Kombination aus bestehenden Zuständen (`review`, `done`, `failed`) und persistierten Records (QA, Approval, PromotionRequest) abgedeckt. Eine Einführung separater Ticket-States für diese Phasen ist operativ aktuell nicht erforderlich.
 
 ---
 
 ## Regeln
 
-1. **Ein aktives Ticket pro Worker-Typ** (aktuell: ein aktives Ticket global via `max_active_tickets`)
+1. **Ein aktives Ticket global** via `max_active_tickets` (default: 1)
 2. **Branch-Validierung** vor Aktivierung: kein protected Branch, kein Traversal
 3. **Ticket wird nie gelöscht** — nur zwischen Zustandsverzeichnissen verschoben
-4. **Promotion ist nie automatisch** — Creative Director Approval ist mandatory
+4. **Promotion ist nie automatisch** — erfordert QA + Approval + manuelle Ausführung
 5. **Ticket-ID ist immutable** — wird bei Erstellung gesetzt, ändert sich nie
 6. **Ticket-Dateien sind die Source of Truth** — kein externer State Store
+7. **Kein Agent darf direkt auf prod_repo arbeiten** — Workers arbeiten nur auf test_repo
+8. **Records (QA, Approval, PromotionRequest) sind immutable** — einmal geschrieben, nicht änderbar

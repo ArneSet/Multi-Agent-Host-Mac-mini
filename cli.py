@@ -29,7 +29,7 @@ Usage:
     python3 cli.py intake-status
     python3 cli.py whatsapp-config
     python3 cli.py whatsapp-validate
-    python3 cli.py whatsapp-simulate --sender SENDER --message MESSAGE
+    python3 cli.py whatsapp-simulate-batch --messages SENDER:TEXT [SENDER:TEXT ...]
     python3 cli.py whatsapp-status
     python3 cli.py whatsapp-audit-show
     python3 cli.py whatsapp-allowlist-show
@@ -1033,11 +1033,6 @@ def main():
 
     # whatsapp-validate
     sub.add_parser("whatsapp-validate", help="Validate WhatsApp connector configuration")
-
-    # whatsapp-simulate
-    p_wsim = sub.add_parser("whatsapp-simulate", help="Simulate WhatsApp message")
-    p_wsim.add_argument("--sender", required=True, help="Sender phone number")
-    p_wsim.add_argument("--message", required=True, help="Message text")
 
     # whatsapp-simulate-batch
     p_wsimb = sub.add_parser("whatsapp-simulate-batch", help="Simulate WhatsApp batch")

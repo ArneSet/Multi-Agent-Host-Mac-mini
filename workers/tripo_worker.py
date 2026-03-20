@@ -18,6 +18,8 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
             "success": True,
             "message": f"[DRY-RUN] tripo-worker would process: {title}",
             "artifacts": [],
+            "changeset_dir": None,
+            "files_written": [],
         }
 
     artifacts_dir = Path(cfg["management_root"]) / cfg["artifacts_dir"]
@@ -40,4 +42,6 @@ def execute(cfg: dict, ticket: dict, dry_run: bool = False) -> dict:
         "success": True,
         "message": f"tripo-worker validated '{title}' (stub). No API calls made.",
         "artifacts": [str(artifact_path)],
+        "changeset_dir": None,
+        "files_written": [],
     }

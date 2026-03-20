@@ -1,7 +1,7 @@
 # QA Decision Model
 
-**Status**: Sprint 11A — QA Gate Hardening
-**Date**: 2026-03-19
+**Status**: Sprint 11A → updated Sprint 11B (2026-03-20)
+**Date**: 2026-03-20
 **Purpose**: Formalize QA decision states beyond binary pass/fail
 
 ## Problem Statement
@@ -64,35 +64,40 @@ QA decisions should use four states:
 
 ## Mapping to Current Implementation
 
-### Current State (pre-11A)
+### Pre-11A State (historical)
 
 ```
 create_qa_result(cfg, ticket_id, passed=True|False, notes="...")
 ```
 
-Only two values: `True` or `False`. No blocked/inconclusive.
+Only two values: `True` or `False`. No blocked/inconclusive. Notes prefixes were used as informal convention.
 
-### Target State (post-11A)
+### Current State (Sprint 11B — implemented)
 
-The `notes` field in the QA result should carry the decision context.
-The `passed` field remains the gate-relevant boolean.
+`create_qa_result()` now accepts a `decision` parameter with four values:
 
-Mapping:
+```
+create_qa_result(cfg, ticket_id, passed, notes="...", decision="pass|fail|blocked|inconclusive")
+```
 
-| Decision | `passed` | `notes` prefix | Promotion |
-|----------|----------|---------------|-----------|
-| pass | `True` | (any) | allowed |
-| fail | `False` | `FAIL: ...` | blocked |
-| blocked | `False` | `BLOCKED: ...` | blocked |
-| inconclusive | `False` | `INCONCLUSIVE: ...` | blocked |
+| Decision | `passed` | Promotion | Mechanism |
+|----------|----------|-----------|-----------|
+| pass | `True` | allowed | `decision` field in QA record |
+| fail | `False` | blocked | `decision` field in QA record |
+| blocked | `False` | blocked | `decision` field in QA record |
+| inconclusive | `False` | blocked | `decision` field in QA record |
 
-**Rationale**: The promotion system only checks `passed: bool`. Adding a new field would require changes across CLI, orchestrator, and tests. Using `notes` prefix preserves backward compatibility while adding operational clarity.
+**Implementation**: `decision` is a first-class field in the QA record (schema v2). The `passed` boolean is derived from `decision == "pass"` at creation time. Legacy calls without `decision` infer it from `passed` for backward compatibility.
+
+CLI commands: `qa-pass`, `qa-fail`, `qa-decide {id} {decision}`.
 
 This means:
 - `fail`, `blocked`, and `inconclusive` all result in `passed: False`
-- The distinction is in the `notes` field for operator visibility
+- The `decision` field provides the authoritative QA state
+- The `passed` field is the gate-relevant boolean for promotion
 - Promotion is blocked for all three non-pass states
 - The difference matters for the **operator's follow-up action**, not for the gate logic
+- Notes prefixes (`BLOCKED:`, `FAIL:`, etc.) are still acceptable as informational context but are no longer the primary mechanism
 
 ## Decision Flow
 

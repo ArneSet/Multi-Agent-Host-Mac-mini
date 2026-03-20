@@ -24,12 +24,16 @@ Both must coexist without silent breaking changes.
 
 ## Current State
 
-As of Sprint 11B, **no QA records exist on disk**. The `reviews/` directory has never been created because no ticket has been put through the manual QA gate (`qa-pass`/`qa-fail`). All reference tickets stopped at `review/` state.
+As of Sprint 11B, two QA records exist on disk in `reviews/`:
+- `sprint-10c-ref-001.qa.json` — schema v2, decision "pass"
+- `unity-10c-followup-001.qa.json` — schema v2, decision "pass"
 
-This means there is technically no migration problem — yet. But the compatibility rules must be defined now because:
-- Tests create v1-format records
-- Future code may encounter records from either schema version
-- The rules must be clear before records start accumulating
+Both are already v2 format. No v1 records exist on disk.
+
+The compatibility rules below are defined primarily for:
+- Tests that may create v1-format records (legacy API calls without `decision`)
+- Future code that may encounter records from either schema version
+- Preventing silent breakage if legacy tooling creates v1-format records
 
 ## Schema Versions
 
@@ -113,11 +117,19 @@ In v2, these are superseded by the `decision` field:
 
 ### Contradictory `passed` and `decision`
 
-Should not occur because `create_qa_result()` enforces the invariant.
-If encountered in a manually edited file:
-- `decision` takes precedence
-- Log a warning
-- `passed` is treated as unreliable
+Should not occur because `create_qa_result()` enforces the invariant at creation time.
+
+**Hardening (Sprint 11B, 2026-03-20):** `_qa_is_promotable()` now enforces consistency at read time.
+Both `check_promotion_readiness()` and `create_promotion_request()` use `_qa_is_promotable(qa)` instead of raw `qa.get("passed")`.
+
+Behavior:
+- If `decision` is present and contradicts `passed`, raises `ValueError` ("QA record integrity error")
+- If `decision` is present and consistent, `decision` is canonical
+- If `decision` is absent (legacy v1), falls back to `passed` boolean
+
+This closes the previously documented gap where manual file tampering could bypass promotion gates.
+
+**Verified against code (2026-03-20):** 97 tests passing, including 5 regression tests for tampered QA records.
 
 ## Summary
 

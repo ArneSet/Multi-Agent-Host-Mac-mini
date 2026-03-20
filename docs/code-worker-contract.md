@@ -1,8 +1,8 @@
 # Code Worker Contract
 
-> **Sprint:** 10A — Worker Operationalization: Code Worker First  
-> **Date:** 2026-03-19  
-> **Status:** Frozen — canonical contract  
+> **Sprint:** 10A (created), 12A (verified against code)  
+> **Date:** 2026-03-20  
+> **Status:** Active — verified against code  
 > **Worker Classification:** limited real output in test_repo  
 
 ---
@@ -62,7 +62,7 @@ The code-worker is the first HYBRIS worker to produce **real, verifiable output*
 | Import or call `dispatch_worker`, `execute_promotion`, `process_ticket` | Execution boundary |
 | Execute shell commands (`subprocess`, `os.system`, `os.popen`) | No shell exec from worker |
 | Network access (`urllib`, `http`, `socket`) | No network from worker |
-| Delete existing files in test_repo | Preservation rule (create/modify only for Sprint 10A) |
+| Delete existing files in test_repo | Preservation rule (create/modify only) |
 | Write to paths containing `..` or absolute paths outside containment | Path traversal prevention |
 
 ---
@@ -170,7 +170,7 @@ The ticket parser (`parse_ticket`) is **not a real YAML parser**. It uses regex 
 ## What This Contract Does NOT Cover
 
 - Git operations (commit, push, branch creation) — deferred
-- Multi-file complex changes — Sprint 10A uses single-file reference changes
+- Multi-file complex changes — single-file reference changes only
 - C# compilation or syntax checking — deferred to later sprint
 - Interaction with Unity Editor — out of scope
 - Network or API calls — forbidden
