@@ -1,8 +1,8 @@
 # Unity Worker Contract
 
-> **Sprint:** 10B — Unity Worker Activation (Minimal)  
-> **Date:** 2026-03-19  
-> **Status:** Active  
+> **Sprint:** 10B (created), 12A (verified against code)  
+> **Date:** 2026-03-20  
+> **Status:** Active — verified against code  
 > **Worker Classification:** limited validation output in test_repo  
 
 ---
@@ -131,6 +131,16 @@ The worker resolves the Unity Editor binary from `ProjectSettings/ProjectVersion
 2. **Unity log:** `management/changeset/ticket-{id}/metadata/unity_log.txt`
 3. **Changeset metadata:** `management/changeset/ticket-{id}/metadata/changeset.json`
 4. **Changeset manifest:** `management/changeset/ticket-{id}/metadata/manifest.json`
+
+---
+
+## Project Structure Validation
+
+Before any Unity CLI invocation, the worker validates:
+1. `Assets/` directory must exist under `_agent_repo`
+2. `ProjectSettings/` directory must exist under `_agent_repo`
+
+If either is missing, the worker fails immediately with a clear error message.
 
 ---
 

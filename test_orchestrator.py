@@ -532,6 +532,49 @@ class TestReviewApprovalPromotion(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             orc.create_approval_decision(self.cfg, "t-no-review", "approved")
 
+    # --- Sprint 11C: ApprovalDecision schema_version ---
+
+    def test_approval_has_schema_version(self):
+        """New ApprovalDecision records include schema_version."""
+        tid = self._put_ticket_in_review("t-schema-v")
+        orc.create_review_package(self.cfg, "t-schema-v")
+        record = orc.create_approval_decision(self.cfg, "t-schema-v", "approved")
+        self.assertEqual(record["schema_version"], 1)
+        # Verify persisted
+        loaded = orc.load_approval_decision(self.cfg, "t-schema-v")
+        self.assertEqual(loaded["schema_version"], 1)
+
+    def test_legacy_approval_without_schema_version_loads(self):
+        """Pre-11C ApprovalDecision without schema_version still loads fine."""
+        tid = self._put_ticket_in_review("t-legacy-appr")
+        orc.create_review_package(self.cfg, "t-legacy-appr")
+        # Write a legacy record directly (no schema_version)
+        reviews = Path(self.cfg["management_root"]) / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        approval_path = reviews / "t-legacy-appr.approval.json"
+        with open(approval_path, "w", encoding="utf-8") as f:
+            json.dump({"ticket_id": "t-legacy-appr", "decision": "approved",
+                        "reviewer": "creative-director", "reason": "",
+                        "decided_at": "2026-01-01T00:00:00Z"}, f)
+        loaded = orc.load_approval_decision(self.cfg, "t-legacy-appr")
+        self.assertEqual(loaded["decision"], "approved")
+        self.assertNotIn("schema_version", loaded)
+
+    def test_promotion_works_with_legacy_approval(self):
+        """Promotion succeeds with pre-11C approval (no schema_version)."""
+        tid = self._put_ticket_in_review("t-promo-legacy")
+        orc.create_review_package(self.cfg, "t-promo-legacy")
+        # Write legacy approval directly
+        reviews = Path(self.cfg["management_root"]) / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        with open(reviews / "t-promo-legacy.approval.json", "w") as f:
+            json.dump({"ticket_id": "t-promo-legacy", "decision": "approved",
+                        "reviewer": "creative-director", "reason": "",
+                        "decided_at": "2026-01-01T00:00:00Z"}, f)
+        orc.create_qa_result(self.cfg, "t-promo-legacy", True)
+        request = orc.create_promotion_request(self.cfg, "t-promo-legacy")
+        self.assertEqual(request["status"], "pending")
+
     def test_promotion_requires_approval(self):
         tid = self._put_ticket_in_review()
         orc.create_review_package(self.cfg, tid)
@@ -817,6 +860,85 @@ class TestQAGate(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             orc.create_promotion_request(self.cfg, "t-qa-promo-blk")
         self.assertIn("QA has not passed", str(ctx.exception))
+
+    # --- Sprint 11B: QA record consistency hardening ---
+
+    def _write_tampered_qa(self, ticket_id, decision, passed):
+        """Write a QA record directly to disk, bypassing create_qa_result().
+        Simulates manual file tampering."""
+        reviews = Path(self.cfg["management_root"]) / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        qa_path = reviews / f"{ticket_id}.qa.json"
+        record = {
+            "schema_version": 2,
+            "ticket_id": ticket_id,
+            "decision": decision,
+            "passed": passed,
+            "notes": "tampered record for testing",
+            "validated_at": "2026-03-20T00:00:00Z",
+            "validator": "test-tamper",
+        }
+        with open(qa_path, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+
+    def test_tampered_qa_fail_passed_true_blocks_promotion(self):
+        """Tampered QA: decision=fail but passed=true must block promotion."""
+        tid = self._put_ticket_in_review("t-tamper-fail")
+        orc.create_review_package(self.cfg, "t-tamper-fail")
+        orc.create_approval_decision(self.cfg, "t-tamper-fail", "approved")
+        self._write_tampered_qa("t-tamper-fail", decision="fail", passed=True)
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, "t-tamper-fail")
+        self.assertIn("integrity error", str(ctx.exception))
+
+    def test_tampered_qa_blocked_passed_true_blocks_promotion(self):
+        """Tampered QA: decision=blocked but passed=true must block promotion."""
+        tid = self._put_ticket_in_review("t-tamper-blk")
+        orc.create_review_package(self.cfg, "t-tamper-blk")
+        orc.create_approval_decision(self.cfg, "t-tamper-blk", "approved")
+        self._write_tampered_qa("t-tamper-blk", decision="blocked", passed=True)
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, "t-tamper-blk")
+        self.assertIn("integrity error", str(ctx.exception))
+
+    def test_tampered_qa_inconclusive_passed_true_blocks_promotion(self):
+        """Tampered QA: decision=inconclusive but passed=true must block promotion."""
+        tid = self._put_ticket_in_review("t-tamper-inc")
+        orc.create_review_package(self.cfg, "t-tamper-inc")
+        orc.create_approval_decision(self.cfg, "t-tamper-inc", "approved")
+        self._write_tampered_qa("t-tamper-inc", decision="inconclusive", passed=True)
+        with self.assertRaises(ValueError) as ctx:
+            orc.create_promotion_request(self.cfg, "t-tamper-inc")
+        self.assertIn("integrity error", str(ctx.exception))
+
+    def test_tampered_qa_readiness_check_detects_inconsistency(self):
+        """check_promotion_readiness() detects tampered QA record."""
+        tid = self._put_ticket_in_review("t-tamper-rdy")
+        orc.create_review_package(self.cfg, "t-tamper-rdy")
+        orc.create_approval_decision(self.cfg, "t-tamper-rdy", "approved")
+        self._write_tampered_qa("t-tamper-rdy", decision="fail", passed=True)
+        result = orc.check_promotion_readiness(self.cfg, "t-tamper-rdy")
+        qa_check = [c for c in result["checks"] if c["name"] == "qa_gate"][0]
+        self.assertFalse(qa_check["passed"])
+        self.assertIn("integrity error", qa_check["detail"])
+        self.assertFalse(result["ready"])
+
+    def test_legacy_qa_no_decision_field_still_works(self):
+        """Legacy v1 QA record without decision field: passed=true allows promotion."""
+        tid = self._put_ticket_in_review("t-legacy-v1")
+        orc.create_review_package(self.cfg, "t-legacy-v1")
+        orc.create_approval_decision(self.cfg, "t-legacy-v1", "approved")
+        # Write a v1-style record (no decision, no schema_version)
+        reviews = Path(self.cfg["management_root"]) / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        qa_path = reviews / f"t-legacy-v1.qa.json"
+        with open(qa_path, "w", encoding="utf-8") as f:
+            json.dump({"ticket_id": "t-legacy-v1", "passed": True,
+                        "notes": "legacy", "validated_at": "2026-01-01T00:00:00Z",
+                        "validator": "test"}, f)
+        # Should NOT raise — legacy record is promotable
+        request = orc.create_promotion_request(self.cfg, "t-legacy-v1")
+        self.assertEqual(request["status"], "pending")
 
 
 # ---------------------------------------------------------------------------

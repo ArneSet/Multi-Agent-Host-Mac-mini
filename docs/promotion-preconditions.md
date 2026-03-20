@@ -38,10 +38,11 @@ All preconditions must pass. Any single failure blocks promotion entirely.
 | Aspect | Value |
 |--------|-------|
 | **Name** | `qa_gate` |
-| **What** | `reviews/{ticket_id}.qa.json` must exist with `passed: true` |
+| **What** | `reviews/{ticket_id}.qa.json` must exist with promotable QA decision |
 | **Why** | Technical QA must confirm structural soundness |
-| **Failure** | No QA record, or `passed: false` (regardless of `decision` value) |
-| **Resolution** | Record QA via `qa-pass` or `qa-fail` CLI commands |
+| **How** | `_qa_is_promotable(qa)` — checks `decision` canonically, detects tampering |
+| **Failure** | No QA record, or QA decision is not "pass", or `decision`/`passed` contradiction |
+| **Resolution** | Record QA via `qa-pass`, `qa-fail`, or `qa-decide` CLI commands |
 
 **Decision-to-gate mapping** (Sprint 11B):
 
