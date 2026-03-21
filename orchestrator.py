@@ -650,11 +650,11 @@ def create_review_package(cfg: dict, ticket_id: str) -> dict:
     ticket = parse_ticket(path)
     mgmt = Path(cfg["management_root"])
 
-    # Gather artifacts
+    # Gather artifacts (underscore separator prevents prefix collisions)
     artifacts_dir = mgmt / cfg["artifacts_dir"]
     artifacts = []
     if artifacts_dir.exists():
-        for f in artifacts_dir.glob(f"{ticket_id}*"):
+        for f in artifacts_dir.glob(f"{ticket_id}_*"):
             artifacts.append(str(f.relative_to(mgmt)))
 
     # Gather worker log
@@ -851,6 +851,7 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
     """
     ticket_id = sanitize_ticket_id(ticket_id)
     checks = []
+    review = None
 
     # 1. ReviewPackage exists
     try:
@@ -927,6 +928,18 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
                             "detail": f"prod_repo not found: {prod_path}"})
     except ValueError as e:
         checks.append({"name": "prod_repo_exists", "passed": False, "detail": str(e)})
+
+    # 6. ReviewPackage artifacts still exist on disk (Sprint 12B)
+    if review is not None:
+        mgmt = Path(cfg["management_root"]).expanduser().resolve()
+        artifact_refs = review.get("artifacts", [])
+        missing = [a for a in artifact_refs if not (mgmt / a).exists()]
+        if missing:
+            checks.append({"name": "artifacts_exist", "passed": False,
+                            "detail": f"{len(missing)} artifact(s) missing: {', '.join(missing)}"})
+        else:
+            checks.append({"name": "artifacts_exist", "passed": True,
+                            "detail": f"{len(artifact_refs)} artifact(s) verified on disk"})
 
     ready = all(c["passed"] for c in checks)
     return {"ready": ready, "ticket_id": ticket_id, "checks": checks}

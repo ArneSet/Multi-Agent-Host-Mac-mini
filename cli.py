@@ -448,9 +448,10 @@ def cmd_qa_decide(cfg, args):
         record = create_qa_result(cfg, args.ticket_id, False,
                                   notes=args.notes or "",
                                   decision=args.decision)
-        label = "PASSED" if record["passed"] else "NOT PASSED"
+        label = record["decision"].upper()
         print(f"QA {label}: {args.ticket_id}")
         print(f"  Decision:     {record['decision']}")
+        print(f"  Promotable:   {'yes' if record['passed'] else 'no'}")
         print(f"  Validated at: {record['validated_at']}")
         if args.notes:
             print(f"  Notes: {args.notes}")
@@ -464,15 +465,19 @@ def cmd_qa_check(cfg, args):
     """Show QA status for a ticket."""
     try:
         qa = load_qa_result(cfg, args.ticket_id)
-        status = "PASSED" if qa.get("passed") else "FAILED"
-        decision = qa.get("decision", "pass" if qa.get("passed") else "fail")
+        decision = qa.get("decision")
+        if decision:
+            label = decision.upper()
+        else:
+            label = "PASSED" if qa.get("passed") else "FAILED"
+        promotable = "yes" if qa.get("passed") else "no"
         print(f"QA Status: {args.ticket_id}")
-        print(f"  Result:    {status}")
-        print(f"  Decision:  {decision}")
-        print(f"  Validated: {qa.get('validated_at', '?')}")
-        print(f"  Validator: {qa.get('validator', '?')}")
+        print(f"  Decision:   {decision or ('pass' if qa.get('passed') else 'fail')}")
+        print(f"  Promotable: {promotable}")
+        print(f"  Validated:  {qa.get('validated_at', '?')}")
+        print(f"  Validator:  {qa.get('validator', '?')}")
         if qa.get("notes"):
-            print(f"  Notes:     {qa['notes']}")
+            print(f"  Notes:      {qa['notes']}")
         return 0 if qa.get("passed") else 1
     except FileNotFoundError:
         print(f"QA Status: {args.ticket_id}")
