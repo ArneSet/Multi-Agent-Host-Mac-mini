@@ -31,6 +31,9 @@ Usage:
     python3 cli.py whatsapp-validate
     python3 cli.py whatsapp-simulate-batch --messages SENDER:TEXT [SENDER:TEXT ...]
     python3 cli.py whatsapp-status
+    python3 cli.py branch-status TICKET_ID
+    python3 cli.py branch-prepare TICKET_ID [--dry-run]
+    python3 cli.py branch-commit TICKET_ID [--message MSG] [--dry-run]
     python3 cli.py whatsapp-audit-show
     python3 cli.py whatsapp-allowlist-show
 """
@@ -64,6 +67,9 @@ from orchestrator import (
     update_promotion_status,
     execute_promotion,
     load_audit_trail,
+    prepare_worker_branch,
+    commit_worker_changes,
+    check_branch_status,
 )
 
 from intake import (
@@ -530,6 +536,73 @@ def cmd_audit_show(cfg, args):
             print(f"      Dry-run: {r['dry_run']}")
         print()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Branch / Commit commands (Sprint 14X-A.1)
+# ---------------------------------------------------------------------------
+
+def cmd_branch_status(cfg, args):
+    """Show branch status in test_repo for a ticket."""
+    try:
+        result = check_branch_status(cfg, args.ticket_id)
+        print(f"Branch Status: {args.ticket_id}")
+        print(f"  Expected branch: {result['branch']}")
+        print(f"  Branch exists:   {'yes' if result['branch_exists'] else 'no'}")
+        print(f"  Checked out:     {'yes' if result['checked_out'] else 'no'}"
+              f" (current: {result['current_branch']})")
+        if result['uncommitted_changes']:
+            print(f"  Uncommitted:     {len(result['uncommitted_changes'])} file(s)")
+            for change in result['uncommitted_changes'][:10]:
+                print(f"    {change}")
+        else:
+            print(f"  Uncommitted:     none")
+        if result['branch_exists']:
+            print(f"  Commits ahead:   {result['commit_count']} (vs main)")
+        return 0
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
+def cmd_branch_prepare(cfg, args):
+    """Prepare the target branch in test_repo for a ticket."""
+    try:
+        result = prepare_worker_branch(cfg, args.ticket_id, dry_run=args.dry_run)
+        prefix = "[DRY-RUN] " if args.dry_run else ""
+        print(f"{prefix}BRANCH PREPARED: {args.ticket_id}")
+        print(f"  Branch:    {result['branch']}")
+        print(f"  Created:   {result['created']}")
+        print(f"  Detail:    {result['detail']}")
+        return 0
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
+def cmd_branch_commit(cfg, args):
+    """Commit worker changes in test_repo for a ticket."""
+    try:
+        result = commit_worker_changes(cfg, args.ticket_id,
+                                       message=args.message or None,
+                                       dry_run=args.dry_run)
+        prefix = "[DRY-RUN] " if args.dry_run else ""
+        if result['committed']:
+            print(f"{prefix}COMMITTED: {args.ticket_id}")
+            print(f"  Branch:    {result['branch']}")
+            print(f"  Commit:    {result['commit_hash']}")
+            print(f"  Files:     {len(result['files_changed'])}")
+        elif result['files_changed']:
+            print(f"{prefix}WOULD COMMIT: {args.ticket_id}")
+            print(f"  Branch:    {result['branch']}")
+            print(f"  Files:     {len(result['files_changed'])}")
+        else:
+            print(f"NO CHANGES: {args.ticket_id}")
+        print(f"  Detail:    {result['detail']}")
+        return 0
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        print(f"ERROR: {e}")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1106,27 @@ def main():
     # intake-status
     sub.add_parser("intake-status", help="Show intake system status")
 
+    # branch-status
+    p_bstatus = sub.add_parser("branch-status",
+                               help="Show branch status in test_repo for a ticket")
+    p_bstatus.add_argument("ticket_id", help="Ticket ID")
+
+    # branch-prepare
+    p_bprep = sub.add_parser("branch-prepare",
+                              help="Prepare target branch in test_repo")
+    p_bprep.add_argument("ticket_id", help="Ticket ID")
+    p_bprep.add_argument("--dry-run", action="store_true",
+                         help="Simulate without creating/checking out branch")
+
+    # branch-commit
+    p_bcommit = sub.add_parser("branch-commit",
+                                help="Commit worker changes in test_repo")
+    p_bcommit.add_argument("ticket_id", help="Ticket ID")
+    p_bcommit.add_argument("--message", default="",
+                           help="Custom commit message")
+    p_bcommit.add_argument("--dry-run", action="store_true",
+                           help="Simulate without committing")
+
     # whatsapp-config
     sub.add_parser("whatsapp-config", help="Show WhatsApp connector configuration")
 
@@ -1082,6 +1176,9 @@ def main():
         "intake-normalize": cmd_intake_normalize,
         "intake-audit-show": cmd_intake_audit_show,
         "intake-status": cmd_intake_status,
+        "branch-status": cmd_branch_status,
+        "branch-prepare": cmd_branch_prepare,
+        "branch-commit": cmd_branch_commit,
         "whatsapp-config": cmd_whatsapp_config,
         "whatsapp-validate": cmd_whatsapp_validate,
         "whatsapp-simulate-batch": cmd_whatsapp_simulate_batch,

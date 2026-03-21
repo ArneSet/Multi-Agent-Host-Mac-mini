@@ -945,6 +945,267 @@ def check_promotion_readiness(cfg: dict, ticket_id: str) -> dict:
     return {"ready": ready, "ticket_id": ticket_id, "checks": checks}
 
 
+# ---------------------------------------------------------------------------
+# Branch / Commit operations (Sprint 14X-A.1)
+# ---------------------------------------------------------------------------
+
+def prepare_worker_branch(cfg: dict, ticket_id: str,
+                          dry_run: bool = False) -> dict:
+    """Prepare the target branch in test_repo for worker output.
+
+    Creates the branch from current HEAD if it doesn't exist, then checks
+    it out.  This is an operator-triggered step — never called automatically
+    by the pipeline.
+
+    Returns: {"branch": str, "created": bool, "checked_out": bool,
+              "detail": str}
+    """
+    ticket_id = sanitize_ticket_id(ticket_id)
+    state, path = find_ticket(cfg, ticket_id)
+    if state is None:
+        raise FileNotFoundError(f"Ticket not found: {ticket_id}")
+
+    ticket = parse_ticket(path)
+    branch = ticket.get("branch", "")
+    validate_branch(cfg, branch)
+
+    agent_repo = Path(resolve_agent_repo(cfg)).resolve()
+
+    # Check if branch already exists
+    check = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "--verify", branch],
+        capture_output=True, text=True, timeout=30,
+    )
+    branch_exists = (check.returncode == 0)
+
+    # Check current branch
+    current = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    current_branch = current.stdout.strip() if current.returncode == 0 else "?"
+
+    if dry_run:
+        if branch_exists:
+            detail = f"Would checkout existing branch '{branch}'"
+        else:
+            detail = (f"Would create and checkout branch '{branch}' "
+                      f"from '{current_branch}'")
+        return {"branch": branch, "created": False,
+                "checked_out": False, "detail": detail}
+
+    # Check for uncommitted changes (safety)
+    status = subprocess.run(
+        ["git", "-C", str(agent_repo), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if status.stdout.strip():
+        raise RuntimeError(
+            f"test_repo has uncommitted changes. "
+            f"Resolve before branch-prepare.\n"
+            f"  git status output:\n{status.stdout.strip()}"
+        )
+
+    created = False
+    if not branch_exists:
+        create = subprocess.run(
+            ["git", "-C", str(agent_repo), "checkout", "-b", branch],
+            capture_output=True, text=True, timeout=30,
+        )
+        if create.returncode != 0:
+            raise RuntimeError(
+                f"Failed to create branch '{branch}': "
+                f"{create.stderr.strip()}"
+            )
+        created = True
+    else:
+        checkout = subprocess.run(
+            ["git", "-C", str(agent_repo), "checkout", branch],
+            capture_output=True, text=True, timeout=30,
+        )
+        if checkout.returncode != 0:
+            raise RuntimeError(
+                f"Failed to checkout branch '{branch}': "
+                f"{checkout.stderr.strip()}"
+            )
+
+    action = "created and checked out" if created else "checked out"
+    write_log(cfg, "orchestrator", ticket_id,
+              f"Branch prepared: {action} '{branch}' in test_repo")
+    return {"branch": branch, "created": created,
+            "checked_out": True, "detail": f"Branch '{branch}' {action} in test_repo"}
+
+
+def commit_worker_changes(cfg: dict, ticket_id: str,
+                          message: str = None,
+                          dry_run: bool = False) -> dict:
+    """Commit worker output in test_repo to the ticket's branch.
+
+    Verifies the current branch matches the ticket's expected branch,
+    stages all changes, and commits.  Operator-triggered — never called
+    automatically.
+
+    Returns: {"branch": str, "committed": bool, "commit_hash": str|None,
+              "detail": str, "files_changed": list}
+    """
+    ticket_id = sanitize_ticket_id(ticket_id)
+    state, path = find_ticket(cfg, ticket_id)
+    if state is None:
+        raise FileNotFoundError(f"Ticket not found: {ticket_id}")
+
+    ticket = parse_ticket(path)
+    expected_branch = ticket.get("branch", "")
+    validate_branch(cfg, expected_branch)
+
+    agent_repo = Path(resolve_agent_repo(cfg)).resolve()
+
+    # Verify current branch matches expected
+    current = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    current_branch = current.stdout.strip()
+    if current_branch != expected_branch:
+        raise ValueError(
+            f"Branch mismatch: test_repo is on '{current_branch}', "
+            f"ticket expects '{expected_branch}'. "
+            f"Run branch-prepare first."
+        )
+
+    # Check for changes
+    status = subprocess.run(
+        ["git", "-C", str(agent_repo), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=30,
+    )
+    changed_files = [
+        line.strip()
+        for line in status.stdout.strip().split("\n")
+        if line.strip()
+    ]
+
+    if not changed_files:
+        return {"branch": expected_branch, "committed": False,
+                "commit_hash": None,
+                "detail": "No changes to commit.",
+                "files_changed": []}
+
+    if dry_run:
+        return {"branch": expected_branch, "committed": False,
+                "commit_hash": None,
+                "detail": (f"Would commit {len(changed_files)} file(s) "
+                           f"on branch '{expected_branch}'"),
+                "files_changed": changed_files}
+
+    # Stage all changes
+    add = subprocess.run(
+        ["git", "-C", str(agent_repo), "add", "-A"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if add.returncode != 0:
+        raise RuntimeError(f"git add failed: {add.stderr.strip()}")
+
+    # Commit
+    commit_msg = message or f"worker output for ticket {ticket_id}"
+    commit = subprocess.run(
+        ["git", "-C", str(agent_repo), "commit", "-m", commit_msg],
+        capture_output=True, text=True, timeout=30,
+    )
+    if commit.returncode != 0:
+        raise RuntimeError(f"git commit failed: {commit.stderr.strip()}")
+
+    # Get commit hash
+    rev = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    commit_hash = rev.stdout.strip() if rev.returncode == 0 else "?"
+
+    write_log(cfg, "orchestrator", ticket_id,
+              f"Changes committed: {commit_hash[:8]} on branch "
+              f"'{expected_branch}' ({len(changed_files)} file(s))")
+    return {"branch": expected_branch, "committed": True,
+            "commit_hash": commit_hash,
+            "detail": (f"Committed {len(changed_files)} file(s) on branch "
+                       f"'{expected_branch}' ({commit_hash[:8]})"),
+            "files_changed": changed_files}
+
+
+def check_branch_status(cfg: dict, ticket_id: str) -> dict:
+    """Check Git branch status in test_repo for a ticket.
+
+    Returns: {"branch": str, "branch_exists": bool, "checked_out": bool,
+              "current_branch": str, "uncommitted_changes": list,
+              "commit_count": int, "detail": str}
+    """
+    ticket_id = sanitize_ticket_id(ticket_id)
+    state, path = find_ticket(cfg, ticket_id)
+    if state is None:
+        raise FileNotFoundError(f"Ticket not found: {ticket_id}")
+
+    ticket = parse_ticket(path)
+    expected_branch = ticket.get("branch", "")
+    if not expected_branch:
+        raise ValueError(f"Ticket '{ticket_id}' has no branch field.")
+
+    agent_repo = Path(resolve_agent_repo(cfg)).resolve()
+
+    # Check if branch exists
+    check = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "--verify",
+         expected_branch],
+        capture_output=True, text=True, timeout=30,
+    )
+    branch_exists = (check.returncode == 0)
+
+    # Check current branch
+    current = subprocess.run(
+        ["git", "-C", str(agent_repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    current_branch = (current.stdout.strip()
+                      if current.returncode == 0 else "?")
+    checked_out = (current_branch == expected_branch)
+
+    # Check uncommitted changes
+    status = subprocess.run(
+        ["git", "-C", str(agent_repo), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=30,
+    )
+    uncommitted = [
+        line.strip()
+        for line in status.stdout.strip().split("\n")
+        if line.strip()
+    ]
+
+    # Count commits ahead of main (if branch exists)
+    commit_count = 0
+    if branch_exists:
+        count = subprocess.run(
+            ["git", "-C", str(agent_repo), "rev-list", "--count",
+             f"main..{expected_branch}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if count.returncode == 0:
+            try:
+                commit_count = int(count.stdout.strip())
+            except ValueError:
+                pass
+
+    parts = []
+    parts.append(f"Branch '{expected_branch}': "
+                 f"{'exists' if branch_exists else 'does not exist'}")
+    parts.append(f"Current branch: {current_branch}")
+    if uncommitted:
+        parts.append(f"{len(uncommitted)} uncommitted change(s)")
+    if commit_count > 0:
+        parts.append(f"{commit_count} commit(s) ahead of main")
+
+    return {"branch": expected_branch, "branch_exists": branch_exists,
+            "checked_out": checked_out, "current_branch": current_branch,
+            "uncommitted_changes": uncommitted,
+            "commit_count": commit_count, "detail": "; ".join(parts)}
+
+
 def create_promotion_request(cfg: dict, ticket_id: str,
                              dry_run: bool = False) -> dict:
     """Create a PromotionRequest. Requires approved ApprovalDecision and repo separation."""

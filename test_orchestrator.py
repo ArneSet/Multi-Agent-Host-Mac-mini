@@ -1191,6 +1191,211 @@ class TestAuditTrail(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Branch / Commit operations (Sprint 14X-A.1)
+# ---------------------------------------------------------------------------
+
+class TestBranchOperations(unittest.TestCase):
+    """Tests for prepare_worker_branch, commit_worker_changes, check_branch_status."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = _make_cfg(self.tmp)
+        mgmt = Path(self.cfg["management_root"])
+        for sub in ["orchestrator", "worker", "agent-runs"]:
+            (mgmt / "logs" / sub).mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # --- prepare_worker_branch ---
+
+    def test_prepare_branch_ticket_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            orc.prepare_worker_branch(self.cfg, "nonexistent")
+
+    def test_prepare_branch_protected_branch_rejected(self):
+        _create_ticket(self.cfg, "ready", "t-br1", branch="main")
+        with self.assertRaises(ValueError) as ctx:
+            orc.prepare_worker_branch(self.cfg, "t-br1")
+        self.assertIn("protected", str(ctx.exception).lower())
+
+    def test_prepare_branch_empty_branch_rejected(self):
+        _create_ticket(self.cfg, "ready", "t-br2", branch="")
+        with self.assertRaises(ValueError):
+            orc.prepare_worker_branch(self.cfg, "t-br2")
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_dry_run_new(self, mock_run):
+        _create_ticket(self.cfg, "ready", "t-br3", branch="feature/test")
+        # rev-parse returns non-zero (branch doesn't exist)
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),   # rev-parse --verify
+            MagicMock(returncode=0, stdout="main\n", stderr=""),  # rev-parse --abbrev-ref
+        ]
+        result = orc.prepare_worker_branch(self.cfg, "t-br3", dry_run=True)
+        self.assertFalse(result["created"])
+        self.assertFalse(result["checked_out"])
+        self.assertIn("Would create", result["detail"])
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_dry_run_existing(self, mock_run):
+        _create_ticket(self.cfg, "ready", "t-br4", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="abc123\n", stderr=""),  # branch exists
+            MagicMock(returncode=0, stdout="main\n", stderr=""),    # current HEAD
+        ]
+        result = orc.prepare_worker_branch(self.cfg, "t-br4", dry_run=True)
+        self.assertIn("Would checkout existing", result["detail"])
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_creates_and_checks_out(self, mock_run):
+        _create_ticket(self.cfg, "ready", "t-br5", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),           # branch doesn't exist
+            MagicMock(returncode=0, stdout="main\n", stderr=""),     # current HEAD
+            MagicMock(returncode=0, stdout="", stderr=""),           # status --porcelain (clean)
+            MagicMock(returncode=0, stdout="", stderr=""),           # checkout -b
+        ]
+        result = orc.prepare_worker_branch(self.cfg, "t-br5")
+        self.assertTrue(result["created"])
+        self.assertTrue(result["checked_out"])
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_dirty_worktree_rejected(self, mock_run):
+        _create_ticket(self.cfg, "ready", "t-br6", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),           # branch doesn't exist
+            MagicMock(returncode=0, stdout="main\n", stderr=""),     # current HEAD
+            MagicMock(returncode=0, stdout="M file.txt\n", stderr=""),  # dirty
+        ]
+        with self.assertRaises(RuntimeError) as ctx:
+            orc.prepare_worker_branch(self.cfg, "t-br6")
+        self.assertIn("uncommitted", str(ctx.exception).lower())
+
+    # --- commit_worker_changes ---
+
+    def test_commit_ticket_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            orc.commit_worker_changes(self.cfg, "nonexistent")
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_branch_mismatch_rejected(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-cm1", branch="feature/test")
+        mock_run.return_value = MagicMock(returncode=0, stdout="main\n", stderr="")
+        with self.assertRaises(ValueError) as ctx:
+            orc.commit_worker_changes(self.cfg, "t-cm1")
+        self.assertIn("mismatch", str(ctx.exception).lower())
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_no_changes(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-cm2", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""),  # current branch
+            MagicMock(returncode=0, stdout="", stderr=""),               # status (clean)
+        ]
+        result = orc.commit_worker_changes(self.cfg, "t-cm2")
+        self.assertFalse(result["committed"])
+        self.assertEqual(result["files_changed"], [])
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_dry_run_shows_files(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-cm3", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""),
+            MagicMock(returncode=0, stdout="M Assets/foo.cs\nA Assets/bar.cs\n", stderr=""),
+        ]
+        result = orc.commit_worker_changes(self.cfg, "t-cm3", dry_run=True)
+        self.assertFalse(result["committed"])
+        self.assertEqual(len(result["files_changed"]), 2)
+        self.assertIn("Would commit", result["detail"])
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_creates_commit(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-cm4", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""),    # current branch
+            MagicMock(returncode=0, stdout="M Assets/foo.cs\n", stderr=""), # status
+            MagicMock(returncode=0, stdout="", stderr=""),                  # git add -A
+            MagicMock(returncode=0, stdout="", stderr=""),                  # git commit
+            MagicMock(returncode=0, stdout="deadbeef1234\n", stderr=""),    # rev-parse HEAD
+        ]
+        result = orc.commit_worker_changes(self.cfg, "t-cm4")
+        self.assertTrue(result["committed"])
+        self.assertEqual(result["commit_hash"], "deadbeef1234")
+        self.assertEqual(len(result["files_changed"]), 1)
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_custom_message(self, mock_run):
+        """Custom commit message is passed to git commit."""
+        _create_ticket(self.cfg, "review", "t-cm5", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""),
+            MagicMock(returncode=0, stdout="M file.txt\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),    # add
+            MagicMock(returncode=0, stdout="", stderr=""),    # commit
+            MagicMock(returncode=0, stdout="aabb1122\n", stderr=""),  # rev-parse
+        ]
+        result = orc.commit_worker_changes(self.cfg, "t-cm5",
+                                           message="custom message")
+        self.assertTrue(result["committed"])
+        # Verify git commit was called with custom message
+        commit_call = mock_run.call_args_list[3]
+        self.assertIn("custom message", commit_call[0][0])
+
+    # --- check_branch_status ---
+
+    def test_check_branch_status_ticket_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            orc.check_branch_status(self.cfg, "nonexistent")
+
+    def test_check_branch_status_no_branch_field(self):
+        _create_ticket(self.cfg, "review", "t-bs1", branch="")
+        with self.assertRaises(ValueError):
+            orc.check_branch_status(self.cfg, "t-bs1")
+
+    @patch("orchestrator.subprocess.run")
+    def test_check_branch_status_branch_exists(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-bs2", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="abc123\n", stderr=""),       # branch exists
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""), # current branch
+            MagicMock(returncode=0, stdout="", stderr=""),               # status clean
+            MagicMock(returncode=0, stdout="1\n", stderr=""),            # 1 commit ahead
+        ]
+        result = orc.check_branch_status(self.cfg, "t-bs2")
+        self.assertTrue(result["branch_exists"])
+        self.assertTrue(result["checked_out"])
+        self.assertEqual(result["commit_count"], 1)
+        self.assertEqual(result["uncommitted_changes"], [])
+
+    @patch("orchestrator.subprocess.run")
+    def test_check_branch_status_branch_missing(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-bs3", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),          # branch doesn't exist
+            MagicMock(returncode=0, stdout="main\n", stderr=""),    # current branch = main
+            MagicMock(returncode=0, stdout="", stderr=""),          # status clean
+        ]
+        result = orc.check_branch_status(self.cfg, "t-bs3")
+        self.assertFalse(result["branch_exists"])
+        self.assertFalse(result["checked_out"])
+        self.assertEqual(result["current_branch"], "main")
+
+    @patch("orchestrator.subprocess.run")
+    def test_check_branch_status_uncommitted_changes(self, mock_run):
+        _create_ticket(self.cfg, "review", "t-bs4", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="abc123\n", stderr=""),       # branch exists
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""), # on right branch
+            MagicMock(returncode=0, stdout="M foo.cs\nA bar.cs\n", stderr=""),  # dirty
+            MagicMock(returncode=0, stdout="2\n", stderr=""),            # 2 ahead
+        ]
+        result = orc.check_branch_status(self.cfg, "t-bs4")
+        self.assertEqual(len(result["uncommitted_changes"]), 2)
+        self.assertEqual(result["commit_count"], 2)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main()
