@@ -1266,13 +1266,50 @@ class TestBranchOperations(unittest.TestCase):
         mock_run.side_effect = [
             MagicMock(returncode=1, stdout="", stderr=""),           # branch doesn't exist
             MagicMock(returncode=0, stdout="main\n", stderr=""),     # current HEAD
-            MagicMock(returncode=0, stdout="M file.txt\n", stderr=""),  # dirty
+            MagicMock(returncode=0, stdout="M file.txt\n", stderr=""),  # tracked dirty
         ]
         with self.assertRaises(RuntimeError) as ctx:
             orc.prepare_worker_branch(self.cfg, "t-br6")
-        self.assertIn("uncommitted", str(ctx.exception).lower())
+        self.assertIn("tracked", str(ctx.exception).lower())
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_untracked_only_allowed(self, mock_run):
+        """Untracked files (??) do not block branch-prepare."""
+        _create_ticket(self.cfg, "ready", "t-br7", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),           # branch doesn't exist
+            MagicMock(returncode=0, stdout="main\n", stderr=""),     # current HEAD
+            MagicMock(returncode=0, stdout="?? Assets/foo.meta\n?? Assets/bar.meta\n", stderr=""),  # untracked only
+            MagicMock(returncode=0, stdout="", stderr=""),           # checkout -b
+        ]
+        result = orc.prepare_worker_branch(self.cfg, "t-br7")
+        self.assertTrue(result["created"])
+        self.assertTrue(result["checked_out"])
+
+    @patch("orchestrator.subprocess.run")
+    def test_prepare_branch_mixed_tracked_and_untracked_rejected(self, mock_run):
+        """If tracked dirty + untracked both present, still block."""
+        _create_ticket(self.cfg, "ready", "t-br8", branch="feature/test")
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="main\n", stderr=""),
+            MagicMock(returncode=0, stdout="M file.txt\n?? untracked.meta\n", stderr=""),
+        ]
+        with self.assertRaises(RuntimeError) as ctx:
+            orc.prepare_worker_branch(self.cfg, "t-br8")
+        self.assertIn("tracked", str(ctx.exception).lower())
 
     # --- commit_worker_changes ---
+
+    def _write_changeset(self, ticket_id, files_written):
+        """Helper: write changeset.json so commit_worker_changes can resolve scope."""
+        mgmt = Path(self.cfg["management_root"])
+        md = mgmt / "changeset" / f"ticket-{ticket_id}" / "metadata"
+        md.mkdir(parents=True, exist_ok=True)
+        import json
+        cs = {"ticket_id": ticket_id, "files_written": files_written}
+        (md / "changeset.json").write_text(
+            json.dumps(cs, indent=2), encoding="utf-8")
 
     def test_commit_ticket_not_found(self):
         with self.assertRaises(FileNotFoundError):
@@ -1287,22 +1324,32 @@ class TestBranchOperations(unittest.TestCase):
         self.assertIn("mismatch", str(ctx.exception).lower())
 
     @patch("orchestrator.subprocess.run")
-    def test_commit_no_changes(self, mock_run):
+    def test_commit_no_changeset_no_commit(self, mock_run):
+        """No changeset metadata => nothing to commit."""
         _create_ticket(self.cfg, "review", "t-cm2", branch="feature/test")
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="feature/test\n", stderr=""),  # current branch
-            MagicMock(returncode=0, stdout="", stderr=""),               # status (clean)
         ]
         result = orc.commit_worker_changes(self.cfg, "t-cm2")
         self.assertFalse(result["committed"])
         self.assertEqual(result["files_changed"], [])
+        self.assertIn("no ticket-scoped", result["detail"].lower())
 
     @patch("orchestrator.subprocess.run")
-    def test_commit_dry_run_shows_files(self, mock_run):
+    def test_commit_dry_run_shows_scoped_files(self, mock_run):
         _create_ticket(self.cfg, "review", "t-cm3", branch="feature/test")
+        # Write changeset with two files
+        self._write_changeset("t-cm3", [
+            {"path": "Assets/foo.cs", "action": "created", "size_bytes": 100},
+            {"path": "Assets/bar.cs", "action": "created", "size_bytes": 200},
+        ])
+        # Create the actual files in test_repo so scope resolution finds them
+        repo = Path(self.cfg["repo_targets"]["test_repo"])
+        (repo / "Assets").mkdir(parents=True, exist_ok=True)
+        (repo / "Assets/foo.cs").write_text("x", encoding="utf-8")
+        (repo / "Assets/bar.cs").write_text("y", encoding="utf-8")
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="feature/test\n", stderr=""),
-            MagicMock(returncode=0, stdout="M Assets/foo.cs\nA Assets/bar.cs\n", stderr=""),
         ]
         result = orc.commit_worker_changes(self.cfg, "t-cm3", dry_run=True)
         self.assertFalse(result["committed"])
@@ -1310,12 +1357,17 @@ class TestBranchOperations(unittest.TestCase):
         self.assertIn("Would commit", result["detail"])
 
     @patch("orchestrator.subprocess.run")
-    def test_commit_creates_commit(self, mock_run):
+    def test_commit_creates_commit_scoped(self, mock_run):
         _create_ticket(self.cfg, "review", "t-cm4", branch="feature/test")
+        self._write_changeset("t-cm4", [
+            {"path": "Assets/foo.cs", "action": "created", "size_bytes": 100},
+        ])
+        repo = Path(self.cfg["repo_targets"]["test_repo"])
+        (repo / "Assets").mkdir(parents=True, exist_ok=True)
+        (repo / "Assets/foo.cs").write_text("x", encoding="utf-8")
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="feature/test\n", stderr=""),    # current branch
-            MagicMock(returncode=0, stdout="M Assets/foo.cs\n", stderr=""), # status
-            MagicMock(returncode=0, stdout="", stderr=""),                  # git add -A
+            MagicMock(returncode=0, stdout="", stderr=""),                  # git add -- scoped
             MagicMock(returncode=0, stdout="", stderr=""),                  # git commit
             MagicMock(returncode=0, stdout="deadbeef1234\n", stderr=""),    # rev-parse HEAD
         ]
@@ -1323,14 +1375,23 @@ class TestBranchOperations(unittest.TestCase):
         self.assertTrue(result["committed"])
         self.assertEqual(result["commit_hash"], "deadbeef1234")
         self.assertEqual(len(result["files_changed"]), 1)
+        # Verify git add was called with specific files, not -A
+        add_call = mock_run.call_args_list[1][0][0]
+        self.assertIn("Assets/foo.cs", add_call)
+        self.assertNotIn("-A", add_call)
 
     @patch("orchestrator.subprocess.run")
     def test_commit_custom_message(self, mock_run):
         """Custom commit message is passed to git commit."""
         _create_ticket(self.cfg, "review", "t-cm5", branch="feature/test")
+        self._write_changeset("t-cm5", [
+            {"path": "Assets/file.txt", "action": "created", "size_bytes": 50},
+        ])
+        repo = Path(self.cfg["repo_targets"]["test_repo"])
+        (repo / "Assets").mkdir(parents=True, exist_ok=True)
+        (repo / "Assets/file.txt").write_text("x", encoding="utf-8")
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="feature/test\n", stderr=""),
-            MagicMock(returncode=0, stdout="M file.txt\n", stderr=""),
             MagicMock(returncode=0, stdout="", stderr=""),    # add
             MagicMock(returncode=0, stdout="", stderr=""),    # commit
             MagicMock(returncode=0, stdout="aabb1122\n", stderr=""),  # rev-parse
@@ -1339,8 +1400,22 @@ class TestBranchOperations(unittest.TestCase):
                                            message="custom message")
         self.assertTrue(result["committed"])
         # Verify git commit was called with custom message
-        commit_call = mock_run.call_args_list[3]
+        commit_call = mock_run.call_args_list[2]
         self.assertIn("custom message", commit_call[0][0])
+
+    @patch("orchestrator.subprocess.run")
+    def test_commit_changeset_path_traversal_rejected(self, mock_run):
+        """Changeset with path traversal in files_written is ignored."""
+        _create_ticket(self.cfg, "review", "t-cm6", branch="feature/test")
+        self._write_changeset("t-cm6", [
+            {"path": "../../etc/passwd", "action": "created", "size_bytes": 10},
+        ])
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="feature/test\n", stderr=""),  # current branch
+        ]
+        result = orc.commit_worker_changes(self.cfg, "t-cm6")
+        self.assertFalse(result["committed"])
+        self.assertEqual(result["files_changed"], [])
 
     # --- check_branch_status ---
 

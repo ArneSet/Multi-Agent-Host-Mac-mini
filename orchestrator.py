@@ -994,17 +994,31 @@ def prepare_worker_branch(cfg: dict, ticket_id: str,
         return {"branch": branch, "created": False,
                 "checked_out": False, "detail": detail}
 
-    # Check for uncommitted changes (safety)
+    # Check for tracked dirty state (safety)
+    # Untracked files (??) are allowed — Unity repos always have untracked .meta
+    # files.  Only tracked modifications block branch-prepare.
     status = subprocess.run(
         ["git", "-C", str(agent_repo), "status", "--porcelain"],
         capture_output=True, text=True, timeout=30,
     )
-    if status.stdout.strip():
+    tracked_dirty = [
+        line for line in status.stdout.strip().split("\n")
+        if line.strip() and not line.startswith("??")
+    ]
+    if tracked_dirty:
         raise RuntimeError(
-            f"test_repo has uncommitted changes. "
+            f"test_repo has tracked uncommitted changes. "
             f"Resolve before branch-prepare.\n"
-            f"  git status output:\n{status.stdout.strip()}"
+            f"  dirty files:\n" + "\n".join(tracked_dirty)
         )
+    untracked_count = sum(
+        1 for line in status.stdout.strip().split("\n")
+        if line.startswith("??")
+    )
+    if untracked_count > 0:
+        write_log(cfg, "orchestrator", ticket_id,
+                  f"branch-prepare: {untracked_count} untracked file(s) "
+                  f"present in test_repo (allowed, not blocking)")
 
     created = False
     if not branch_exists:
@@ -1034,6 +1048,38 @@ def prepare_worker_branch(cfg: dict, ticket_id: str,
               f"Branch prepared: {action} '{branch}' in test_repo")
     return {"branch": branch, "created": created,
             "checked_out": True, "detail": f"Branch '{branch}' {action} in test_repo"}
+
+
+def _resolve_commit_scope(changeset_dir: Path, agent_repo: Path) -> list:
+    """Resolve the list of files a worker wrote, from changeset metadata.
+
+    Reads changeset.json to find files_written paths.  Only returns paths
+    that actually exist in the working tree (relative to agent_repo).
+    Returns list of relative path strings suitable for 'git add -- ...'.
+    """
+    changeset_file = changeset_dir / "changeset.json"
+    if not changeset_file.exists():
+        return []
+    try:
+        with open(changeset_file, "r", encoding="utf-8") as f:
+            changeset = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    scoped = []
+    for entry in changeset.get("files_written", []):
+        rel_path = entry.get("path", "") if isinstance(entry, dict) else str(entry)
+        if not rel_path or ".." in rel_path or rel_path.startswith("/"):
+            continue
+        full = (agent_repo / rel_path).resolve()
+        # containment check
+        try:
+            full.relative_to(agent_repo)
+        except ValueError:
+            continue
+        if full.exists():
+            scoped.append(rel_path)
+    return scoped
 
 
 def commit_worker_changes(cfg: dict, ticket_id: str,
@@ -1072,33 +1118,28 @@ def commit_worker_changes(cfg: dict, ticket_id: str,
             f"Run branch-prepare first."
         )
 
-    # Check for changes
-    status = subprocess.run(
-        ["git", "-C", str(agent_repo), "status", "--porcelain"],
-        capture_output=True, text=True, timeout=30,
-    )
-    changed_files = [
-        line.strip()
-        for line in status.stdout.strip().split("\n")
-        if line.strip()
-    ]
+    # Resolve ticket-scoped file list from changeset metadata
+    mgmt = Path(cfg["management_root"]).expanduser().resolve()
+    changeset_dir = mgmt / "changeset" / f"ticket-{ticket_id}" / "metadata"
+    scoped_files = _resolve_commit_scope(changeset_dir, agent_repo)
 
-    if not changed_files:
+    if not scoped_files:
         return {"branch": expected_branch, "committed": False,
                 "commit_hash": None,
-                "detail": "No changes to commit.",
+                "detail": ("No ticket-scoped files to commit. "
+                           "Changeset metadata missing or files not found in working tree."),
                 "files_changed": []}
 
     if dry_run:
         return {"branch": expected_branch, "committed": False,
                 "commit_hash": None,
-                "detail": (f"Would commit {len(changed_files)} file(s) "
-                           f"on branch '{expected_branch}'"),
-                "files_changed": changed_files}
+                "detail": (f"Would commit {len(scoped_files)} ticket-scoped "
+                           f"file(s) on branch '{expected_branch}'"),
+                "files_changed": scoped_files}
 
-    # Stage all changes
+    # Stage only ticket-scoped files
     add = subprocess.run(
-        ["git", "-C", str(agent_repo), "add", "-A"],
+        ["git", "-C", str(agent_repo), "add", "--"] + scoped_files,
         capture_output=True, text=True, timeout=30,
     )
     if add.returncode != 0:
@@ -1122,12 +1163,12 @@ def commit_worker_changes(cfg: dict, ticket_id: str,
 
     write_log(cfg, "orchestrator", ticket_id,
               f"Changes committed: {commit_hash[:8]} on branch "
-              f"'{expected_branch}' ({len(changed_files)} file(s))")
+              f"'{expected_branch}' ({len(scoped_files)} file(s))")
     return {"branch": expected_branch, "committed": True,
             "commit_hash": commit_hash,
-            "detail": (f"Committed {len(changed_files)} file(s) on branch "
+            "detail": (f"Committed {len(scoped_files)} file(s) on branch "
                        f"'{expected_branch}' ({commit_hash[:8]})"),
-            "files_changed": changed_files}
+            "files_changed": scoped_files}
 
 
 def check_branch_status(cfg: dict, ticket_id: str) -> dict:
